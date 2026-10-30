@@ -1,0 +1,45 @@
+# Runtime and build output / 运行与构建产物
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+runtime/
+runs/
+tasks/
+outputs/
+KiCadRoutingTools/
+PCBWorld-Engine/
+*.so
+*.dylib
+*.dll
+*.o
+*.a
+*.whl
+*.tar.gz
+*.zip
+.DS_Store
+# Machine configuration / 本机配置
+runtime.json
+.pcb-local*.json
+kicad_plugin/pcb_local_launcher/config.json
+kicad_plugin/pcb_local_launcher/INSTALL_MANIFEST.json
+.env
+.env.*
+*.pem
+*.key
+# User hardware must be reviewed explicitly before committing.
+*.kicad_pcb
+*.kicad_pro
+*.kicad_prl
+*.kicad_sch
+*.kicad_dru
+*.dsn
+*.ses
+*.lck
+!examples/local-middle-native/**/board.kicad_pcb
+!examples/local-middle-native/**/board.kicad_pro

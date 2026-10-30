@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "version": "0.9.5.dev13",
+  "date": "2026-10-30",
+  "scope": "Source export, code regressions and installed native protection fixtures on the existing macOS arm64 host.",
+  "runtime_python_files_identical_to_dev13_archive": 77,
+  "code_tests": {
+    "discovered": 834,
+    "initial_passed": 831,
+    "initial_skipped": 3,
+    "initial_failures": 0,
+    "supplemental_pinned_source_tests": 3,
+    "supplemental_passed": 3,
+    "unique_passed_after_supplement": 834
+  },
+  "plugin_code_checks": {
+    "passed": 23,
+    "failures": 0
+  },
+  "installed_cli": {
+    "version": "0.9.5.dev13",
+    "new_venv": true,
+    "version_and_help_passed": true
+  },
+  "patch_catalog_verified": true,
+  "native_examples": {
+    "accepted": {
+      "status": "accepted",
+      "accepted": true,
+      "checks": {
+        "unauthorized_routing_unchanged": true,
+        "modification_permission_valid": true,
+        "modified_track_budget_respected": true,
+        "nonrouting_definitions_unchanged": true,
+        "rules_unchanged": true,
+        "project_rules_available": true,
+        "additions_within_permission": true,
+        "new_via_budget_respected": true,
+        "partial_fixed_tails_preserved": true,
+        "rules_supported": true,
+        "drc_coverage_complete": true,
+        "supplemental_drc_no_new_or_changed": true,
+        "full_drc_no_new_or_changed": true,
+        "existing_components_preserved": true,
+        "added_copper_connected_to_target": true,
+        "input_target_disconnected": true,
+        "library_context_unchanged": true,
+        "target_connected": true,
+        "allowed_layer_exists": true,
+        "source_files_untouched": true,
+        "verification_within_budget": true
+      },
+      "source_report_sha256": "14833e66fab42d22e032dd7bf55caa8acf6d46a57f211e5f938533524ffe0600"
+    },
+    "rejected": {
+      "status": "protection_violation",
+      "accepted": false,
+      "checks": {
+        "unauthorized_routing_unchanged": true,
+        "modification_permission_valid": true,
+        "modified_track_budget_respected": true,
+        "nonrouting_definitions_unchanged": true,
+        "rules_unchanged": true,
+        "project_rules_available": true,
+        "additions_within_permission": false,
+        "new_via_budget_respected": true,
+        "partial_fixed_tails_preserved": false,
+        "rules_supported": true,
+        "drc_coverage_complete": true,
+        "supplemental_drc_no_new_or_changed": true,
+        "full_drc_no_new_or_changed": true,
+        "existing_components_preserved": true,
+        "added_copper_connected_to_target": true,
+        "input_target_disconnected": true,
+        "library_context_unchanged": true,
+        "target_connected": true,
+        "allowed_layer_exists": true,
+        "source_files_untouched": true,
+        "verification_within_budget": true
+      },
+      "source_report_sha256": "44a833489f5402e91eb155e563b4a8852825012fcb2ceab6782a6a2fe10ec6ca"
+    }
+  },
+  "gui_actions_performed": false,
+  "upstream_rebuild_performed": false,
+  "new_real_board_repairs_claimed": 0,
+  "omitted_archive_builder_tests": 17,
+  "local_log_hashes": {
+    "unit-tests": "603227d156a3b0831b82f7fcf17f969e51b491c61ad800f591d3f98389b18de6",
+    "plugin-tests": "e9bef2fe18f4c4d60479622db08affbe6f4c1f579b1a7ba632fde517c4587bfb",
+    "krt-tests": "11132e184c671b3d613c5bfb35cead614795eac669cb678c18cc8d42de734e95",
+    "wheel-build": "d1fa588e1c8401382408d1c265235d571061ae1812021177d5d6d70c6c3f5409"
+  }
+}

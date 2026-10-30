@@ -1,0 +1,87 @@
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 6fcf32f3..23d524d0 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -1062,6 +1062,11 @@ set( PCB_COMMON_SRCS
+ 
+ add_library( pcbcommon STATIC ${PCB_COMMON_SRCS} )
+ 
++# Preserve native DRC completion traces in release builds, independent of PCH.
++set_source_files_properties( ${CMAKE_SOURCE_DIR}/pcbnew/drc/drc_engine.cpp PROPERTIES
++    COMPILE_DEFINITIONS "wxUSE_LOG_TRACE=1"
++    SKIP_PRECOMPILE_HEADERS ON )
++
+ if( KICAD_USE_PCH )
+     target_precompile_headers( pcbcommon
+         PRIVATE
+diff --git a/kicad/CMakeLists.txt b/kicad/CMakeLists.txt
+index dae7b75f..85e28ef1 100644
+--- a/kicad/CMakeLists.txt
++++ b/kicad/CMakeLists.txt
+@@ -230,10 +230,10 @@ if( APPLE )
+         set( PYTHON_FRAMEWORK_HELPER "0" )
+     endif()
+ 
+-    set_target_properties( kicad PROPERTIES BUILD_RPATH ${PYTHON_FRAMEWORK} )
++    set_target_properties( kicad PROPERTIES BUILD_RPATH "${PYTHON_FRAMEWORK}" )
+     set_target_properties( kicad PROPERTIES INSTALL_RPATH
+             "@executable_path/../Frameworks;@executable_path/../Frameworks/Python.framework" )
+-    set_target_properties( kicad-cli PROPERTIES BUILD_RPATH ${PYTHON_FRAMEWORK} )
++    set_target_properties( kicad-cli PROPERTIES BUILD_RPATH "${PYTHON_FRAMEWORK}" )
+     set_target_properties( kicad-cli PROPERTIES INSTALL_RPATH
+             "@executable_path/../Frameworks;@executable_path/../Frameworks/Python.framework" )
+ 
+diff --git a/pcbnew/dialogs/panel_pcbnew_action_plugins.cpp b/pcbnew/dialogs/panel_pcbnew_action_plugins.cpp
+index dad16181..f8c0051b 100644
+--- a/pcbnew/dialogs/panel_pcbnew_action_plugins.cpp
++++ b/pcbnew/dialogs/panel_pcbnew_action_plugins.cpp
+@@ -137,16 +137,20 @@ PANEL_PCBNEW_ACTION_PLUGINS::PANEL_PCBNEW_ACTION_PLUGINS( wxWindow* aParent ) :
+     m_errorDialog = new DIALOG_HTML_REPORTER( aParent );
+     m_allowErrorDialog = false;
+ 
++#ifdef KICAD_IPC_API
+     wxTheApp->Bind( EDA_EVT_PLUGIN_AVAILABILITY_CHANGED,
+           &PANEL_PCBNEW_ACTION_PLUGINS::onPluginAvailabilityChanged, this );
++#endif
+ }
+ 
+ 
+ PANEL_PCBNEW_ACTION_PLUGINS::~PANEL_PCBNEW_ACTION_PLUGINS()
+ {
+     delete m_errorDialog;
++#ifdef KICAD_IPC_API
+     wxTheApp->Unbind( EDA_EVT_PLUGIN_AVAILABILITY_CHANGED,
+             &PANEL_PCBNEW_ACTION_PLUGINS::onPluginAvailabilityChanged, this );
++#endif
+     m_grid->PopEventHandler( true );
+ }
+ 
+diff --git a/pcbnew/drc/drc_engine.cpp b/pcbnew/drc/drc_engine.cpp
+index 60132b53..c90bd70c 100644
+--- a/pcbnew/drc/drc_engine.cpp
++++ b/pcbnew/drc/drc_engine.cpp
+@@ -58,8 +58,8 @@
+ 
+ // wxListBox's performance degrades horrifically with very large datasets.  It's not clear
+ // they're useful to the user anyway.
+-#define ERROR_LIMIT 199
+-#define EXTENDED_ERROR_LIMIT 499
++#define ERROR_LIMIT 2147483647
++#define EXTENDED_ERROR_LIMIT 2147483647
+ 
+ 
+ /**
+@@ -914,6 +914,13 @@ void DRC_ENGINE::RunTests( EDA_UNITS aUnits, bool aReportAllTrackErrors, bool aT
+     m_reportAllTrackErrors = aReportAllTrackErrors;
+     m_testFootprints = aTestFootprints;
+ 
++    // Release wxWidgets may not import WXTRACE masks from the environment.
++    if( wxGetEnv( wxS( "KICAD_ENABLE_WXTRACE" ), nullptr ) )
++        wxLog::AddTraceMask( traceDrcProfile );
++
++    wxLogTrace( traceDrcProfile, "PCB_LOCAL_DRC_REPORT_CAPACITY per_type=%d extended=%d",
++                ERROR_LIMIT, EXTENDED_ERROR_LIMIT );
++
+     for( int ii = DRCE_FIRST; ii <= DRCE_LAST; ++ii )
+     {
+         if( m_designSettings->Ignore( ii ) )

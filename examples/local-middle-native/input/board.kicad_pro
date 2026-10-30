@@ -1,0 +1,64 @@
+{
+  "meta": {
+    "version": 1
+  },
+  "board": {
+    "design_settings": {
+      "rules": {
+        "min_clearance": 0.2,
+        "min_track_width": 0.25,
+        "min_copper_edge_clearance": 0.2
+      },
+      "rule_severities": {
+        "annular_width": "error",
+        "clearance": "error",
+        "connection_width": "error",
+        "copper_edge_clearance": "error",
+        "copper_sliver": "error",
+        "creepage": "error",
+        "diff_pair_gap_out_of_range": "error",
+        "diff_pair_uncoupled_length_too_long": "error",
+        "drill_out_of_range": "error",
+        "hole_clearance": "error",
+        "hole_to_hole": "error",
+        "invalid_outline": "error",
+        "isolated_copper": "error",
+        "item_on_disabled_layer": "error",
+        "items_not_allowed": "error",
+        "length_out_of_range": "error",
+        "missing_tuning_profile": "error",
+        "shorting_items": "error",
+        "silk_over_copper": "error",
+        "skew_out_of_range": "error",
+        "solder_mask_bridge": "error",
+        "starved_thermal": "error",
+        "too_many_vias": "error",
+        "track_angle": "error",
+        "track_dangling": "error",
+        "track_not_centered_on_via": "error",
+        "track_on_post_machined_layer": "error",
+        "track_segment_length": "error",
+        "track_width": "error",
+        "tracks_crossing": "error",
+        "tuning_profile_track_geometries": "error",
+        "unconnected_items": "error",
+        "via_dangling": "error",
+        "via_diameter": "error",
+        "zones_intersect": "error"
+      }
+    }
+  },
+  "net_settings": {
+    "classes": [
+      {
+        "name": "Default",
+        "clearance": 0.2,
+        "track_width": 0.25,
+        "via_diameter": 0.6,
+        "via_drill": 0.3,
+        "diff_pair_width": 0.25,
+        "diff_pair_gap": 0.2
+      }
+    ]
+  }
+}

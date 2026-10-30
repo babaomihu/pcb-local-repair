@@ -1,0 +1,1688 @@
+diff --git a/py_router/design_rules.py b/py_router/design_rules.py
+index de3fdd3..bfe4f8c 100644
+--- a/py_router/design_rules.py
++++ b/py_router/design_rules.py
+@@ -900,7 +900,8 @@ def project_class_membership(net_settings) -> Tuple[Dict[str, List[str]],
+       most ``KICAD6_MEMBERS_MAX_SCHEMA`` (#1304). Those are exact net names:
+       KiCad's migration makes each a pattern, and a pattern spelled as a whole
+       net name matches that net.
+-    * ``patterns`` -- [(glob, class)] from ``netclass_patterns``, file order.
++    * ``patterns`` -- [(pattern, class)] from ``netclass_patterns``, file order;
++      the shared matcher handles KiCad's regex/wildcard and supported bus forms.
+     """
+     ns = net_settings if isinstance(net_settings, dict) else {}
+     assignments: Dict[str, List[str]] = {}
+@@ -1071,6 +1072,8 @@ class DesignRules:
+         patterns: List[Tuple[str, str]] = []
+         if proj is not None:
+             ns = proj.get('net_settings', {}) or {}
++            from netclass_resolver import project_priorities
++            priorities = project_priorities(ns)
+             for c in ns.get('classes', []) or []:
+                 name = c.get('name', 'Default')
+                 d = {}
+@@ -1079,8 +1082,7 @@ class DesignRules:
+                           'microvia_diameter', 'microvia_drill'):
+                     if isinstance(c.get(k), (int, float)):
+                         d[k] = float(c[k])
+-                d['priority'] = int(c.get('priority', _DEFAULT_PRIORITY
+-                                          if name == 'Default' else 0))
++                d['priority'] = priorities[name]
+                 self.classes[name] = d
+             # every membership form, KiCad 6's classes[].nets included (#1304)
+             assignments, patterns = project_class_membership(ns)
+@@ -1103,19 +1105,8 @@ class DesignRules:
+                 pass
+         # memberships: explicit assignment UNION every matching pattern (KiCad
+         # merges), the same rule list_nets.net_class_memberships applies.
+-        for nid, name in self.net_names.items():
+-            cand = set(assignments.get(name, []))
+-            for pat, cname in patterns:
+-                if not pat:
+-                    continue
+-                try:
+-                    if fnmatch.fnmatchcase(name, pat):
+-                        cand.add(cname)
+-                except Exception:                              # noqa: BLE001
+-                    pass
+-            cand = {c for c in cand if c in self.classes or c == 'Default'}
+-            if cand:
+-                self.memberships[nid] = frozenset(cand)
++        from netclass_resolver import resolve_memberships
++        self.memberships = resolve_memberships(self.net_names, assignments, patterns)
+ 
+     def _finish(self) -> None:
+         if 'Default' not in self.classes:
+@@ -1131,8 +1122,8 @@ class DesignRules:
+         class (Default when it belongs to none)."""
+         e = self._effective.get(net_id)
+         if e is None:
+-            members = [c for c in self.memberships.get(net_id, ()) if c in self.classes]
+-            members.sort(key=lambda c: (self.classes[c].get('priority', 0), c))
++            from netclass_resolver import ordered_members
++            members = ordered_members(self.classes, self.memberships.get(net_id, ()))
+             e = members[0] if members else 'Default'
+             self._effective[net_id] = e
+         return e
+@@ -1140,13 +1131,8 @@ class DesignRules:
+     def class_value(self, net_id: int, prop: str) -> Optional[float]:
+         """``prop`` from the aggregate class: the highest-priority member class
+         that SETS it, else Default's, else None."""
+-        members = [c for c in self.memberships.get(net_id, ()) if c in self.classes]
+-        members.sort(key=lambda c: (self.classes[c].get('priority', 0), c))
+-        for c in members + ['Default']:
+-            v = self.classes.get(c, {}).get(prop)
+-            if isinstance(v, (int, float)) and v > 0:
+-                return float(v)
+-        return None
++        from netclass_resolver import class_property
++        return class_property(self.classes, self.memberships.get(net_id, ()), prop)
+ 
+     def item_for_net(self, net_id: int, type: str = 'track',
+                      layer: Optional[str] = None, **facts) -> RuleItem:
+@@ -1496,7 +1482,7 @@ def _netclass_dict(nc) -> dict:
+                 return None
+             fn = getattr(nc, name, None)
+             v = fn() if fn else None
+-            return v / 1e6 if isinstance(v, (int, float)) and v > 0 else None
++            return v / 1e6 if isinstance(v, (int, float)) and v >= 0 else None
+         except Exception:                                      # noqa: BLE001
+             return None
+     d = {'clearance': g('GetClearance', 'HasClearance'),
+diff --git a/py_router/kicad_parser.py b/py_router/kicad_parser.py
+index b69b96b..6a86191 100644
+--- a/py_router/kicad_parser.py
++++ b/py_router/kicad_parser.py
+@@ -422,8 +422,9 @@ class Pad:
+     # outline(s) in GLOBAL board mm for custom comb/finger pads (issue #188).
+     # When set, the obstacle map and DRC rasterize these polygons instead of the
+     # size_x x size_y bounding box, so the finger channels (and the empty side of
+-    # an off-anchor pad) stay routable. None for ordinary rect/circle/roundrect
+-    # pads, which the bounding box models exactly.
++    # an off-anchor pad) stay routable. A chamfered-rect pad (#1450) carries
++    # its outline here too, so a cut corner is not copper. None for ordinary
++    # rect/circle/roundrect pads, which the bounding box models exactly.
+     castellated: bool = False  # KiCad (property pad_prop_castellated): a
+     # deliberate half-hole pad ON the board edge (run-6 fix 1.7). Consumers:
+     # the castellated-landing retract post-pass pulls track endpoints that
+@@ -1481,6 +1482,113 @@ def _adaptive_circle_n(r: float, eps: float = 0.001, lo: int = 16,
+     return max(lo, min(hi, n))
+ 
+ 
++#: KiCad's chamfer corner names (`(chamfer top_left ...)`) in the pad's own
++#: frame (y down), walked clockwise on screen.
++CHAMFER_CORNERS = (('top_left', -1, -1), ('top_right', 1, -1),
++                   ('bottom_right', 1, 1), ('bottom_left', -1, 1))
++
++
++def chamfered_rect_polygon(cx: float, cy: float, w: float, h: float,
++                           abs_rotation_deg: float, corners, chamfer_ratio: float,
++                           corner_radius: float) -> List[Tuple[float, float]]:
++    """The copper outline of KiCad's chamfered rect pad, in board mm (#1450).
++
++    KiCad writes a chamfered-rect pad (Eagle's octagon pads come through its
++    importer this way) as `roundrect` plus `(chamfer <corners>)` and
++    `(chamfer_ratio r)`. Its outline (TransformRoundChamferedRectToPolygon) is
++    the `w` x `h` rect centred on the copper (`cx`, `cy`) with each named
++    corner cut by a 45-degree flat `chamfer_ratio * min(w, h)` along each side,
++    and every OTHER corner rounded by `corner_radius` (the pad's roundrect
++    radius, `roundrect_rratio * min(w, h)`) -- a chamfered corner is never
++    rounded. As in pcbnew, the radius is at most half the short side and the
++    chamfer is not clamped (a ratio past 0.5 overlaps, there too).
++
++    `corners` are names from CHAMFER_CORNERS in the pad's own frame, which
++    KiCad already mirrors when it flips a footprint, so the file's names and
++    the pad's ABSOLUTE angle (`abs_rotation_deg`, applied with KiCad's negate
++    convention as for custom pads) place the outline. Arcs are inscribed with
++    1 um of sagitta, below pcbnew's own 5 um max error."""
++    hx, hy = w / 2.0, h / 2.0
++    short = min(w, h)
++    cut = max(0.0, chamfer_ratio) * short
++    r = max(0.0, min(corner_radius, short / 2.0))
++    named = set(corners)
++    # Chords of a quarter arc with 1 um of sagitta each.
++    n_arc = (min(64, max(2, math.ceil(
++        (math.pi / 2.0) / (2.0 * math.acos(max(-1.0, 1.0 - 0.001 / r))))))
++        if r > 0 else 0)
++    local: List[Tuple[float, float]] = []
++    k = len(CHAMFER_CORNERS)
++    for i, (name, sx, sy) in enumerate(CHAMFER_CORNERS):
++        ccx, ccy = sx * hx, sy * hy
++        _pn, psx, psy = CHAMFER_CORNERS[(i - 1) % k]
++        _nn, nsx, nsy = CHAMFER_CORNERS[(i + 1) % k]
++        # Unit vectors from this corner along its incoming / outgoing side.
++        ux_in, uy_in = (psx - sx) / 2.0, (psy - sy) / 2.0
++        ux_out, uy_out = (nsx - sx) / 2.0, (nsy - sy) / 2.0
++        if name in named:
++            if cut > 0:
++                local.append((ccx + ux_in * cut, ccy + uy_in * cut))
++                local.append((ccx + ux_out * cut, ccy + uy_out * cut))
++            else:
++                local.append((ccx, ccy))
++        elif r > 0:
++            # The quarter arc about the inset corner, from the incoming side
++            # to the outgoing one (+90 degrees on screen, every corner).
++            acx, acy = ccx - sx * r, ccy - sy * r
++            a0 = math.atan2(ccy + uy_in * r - acy, ccx + ux_in * r - acx)
++            for j in range(n_arc + 1):
++                a = a0 + (math.pi / 2.0) * j / n_arc
++                local.append((acx + r * math.cos(a), acy + r * math.sin(a)))
++        else:
++            local.append((ccx, ccy))
++    # Two cuts meeting mid-side (ratio 0.5) leave a repeated vertex.
++    pts: List[Tuple[float, float]] = []
++    for p in local:
++        if not pts or math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-9:
++            pts.append(p)
++    if len(pts) > 1 and math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) <= 1e-9:
++        pts.pop()
++    rad = math.radians(-abs_rotation_deg)
++    c, s = math.cos(rad), math.sin(rad)
++    return [(cx + x * c - y * s, cy + x * s + y * c) for x, y in pts]
++
++
++_CHAMFER_RE = re.compile(r'\(chamfer\s+([^()]*)\)')
++
++
++#: KiCad's default `chamfer_ratio`, and the `roundrect_rratio` its loader
++#: gives a chamfered pad whose file names none (PADSTACK's defaults).
++CHAMFER_RATIO_DEFAULT = 0.2
++ROUNDRECT_RRATIO_DEFAULT = 0.25
++
++
++def chamfered_pad_from_text(pad_text: str, pad_shape: str, w: float, h: float,
++                            cx: float, cy: float, abs_rotation_deg: float):
++    """`([outline], roundrect_rratio)` for a chamfered-rect pad block, else
++    None (#1450).
++
++    `w`/`h` are the pad-frame `(size ...)`, (`cx`, `cy`) the copper centre.
++    KiCad loads a `rect` or `roundrect` pad naming a corner as its chamfered
++    rect, whose other corners take the pad's `roundrect_rratio` (0.25 when the
++    file has none, at most 0.5) -- the ratio returned, as pcbnew reports it. A
++    per-layer padstack is left to its box (its layers may differ), and a pad
++    naming no corner is not chamfered."""
++    if pad_shape not in ('rect', 'roundrect') or re.search(r'\(padstack\s', pad_text):
++        return None
++    m = _CHAMFER_RE.search(pad_text)
++    names = {n for n, _x, _y in CHAMFER_CORNERS}
++    corners = [t for t in (m.group(1).split() if m else ()) if t in names]
++    if not corners or w <= 0 or h <= 0:
++        return None
++    cm = re.search(r'\(chamfer_ratio\s+(%s)\)' % AT_NUM, pad_text)
++    ratio = float(cm.group(1)) if cm else CHAMFER_RATIO_DEFAULT
++    rm = re.search(r'\(roundrect_rratio\s+(%s)\)' % AT_NUM, pad_text)
++    rratio = max(0.0, min(0.5, float(rm.group(1)) if rm else ROUNDRECT_RRATIO_DEFAULT))
++    return ([chamfered_rect_polygon(cx, cy, w, h, abs_rotation_deg, corners,
++                                    ratio, rratio * min(w, h))], rratio)
++
++
+ def _custom_pad_global_polygons(pad_text: str, global_x: float, global_y: float,
+                                 pad_abs_rotation_deg: float):
+     """Real copper outline(s) of a custom pad in GLOBAL board mm (issue #188).
+@@ -1914,6 +2022,39 @@ def _pcbnew_custom_copper_is_anchor(pad, to_mm, eps: float = 1e-4) -> bool:
+         return False
+ 
+ 
++def _pcbnew_chamfered_pad_polygons(pad, to_mm):
++    """`[outline]` in board mm for a live pcbnew chamfered-rect pad, else None
++    (#1450) -- `chamfered_pad_from_text` for the GUI path.
++
++    The outline is pcbnew's effective polygon, which tests/
++    test_1450_chamfered_pad_pcbnew.py holds the text path's
++    chamfered_rect_polygon to. Should pcbnew give none, the pad keeps its box
++    (as a custom pad does). A per-layer padstack is left to its box, as on the
++    text path."""
++    try:
++        import pcbnew as _pn
++        if pad.GetShape() != getattr(_pn, 'PAD_SHAPE_CHAMFERED_RECT', object()):
++            return None
++        if not pad.GetChamferPositions():
++            return None
++        if hasattr(pad, 'Padstack') and pad.Padstack().Mode() != _pn.PADSTACK.MODE_NORMAL:
++            return None
++    except Exception:
++        return None
++    try:
++        poly_set = pad.GetEffectivePolygon(pad.GetLayer())
++        polys = []
++        for oi in range(poly_set.OutlineCount()):
++            ol = poly_set.Outline(oi)
++            pts = [(to_mm(ol.CPoint(i).x), to_mm(ol.CPoint(i).y))
++                   for i in range(ol.PointCount())]
++            if len(pts) >= 3:
++                polys.append(pts)
++        return polys or None
++    except Exception:
++        return None
++
++
+ def pad_is_plated_through(pad) -> bool:
+     """True if the pad's hole has a PLATED copper barrel tying every copper
+     layer together (a real through-hole pin/via-in-pad). `drill > 0` alone is
+@@ -4761,6 +4902,7 @@ def extract_footprints_and_pads(content: str, nets: Dict[int, Net],
+             # rotation into the dimensions so all downstream axis-aligned
+             # geometry stays exact; genuine diagonal pads keep a residual
+             # rect_rotation the obstacle/DRC geometry applies.
++            _frame_size = (size_x, size_y)  # pad frame, for a chamfer (#1450)
+             if not custom_resolved:
+                 size_x, size_y, rect_rotation = _resolve_pad_rect(size_x, size_y, pad_rotation)
+ 
+@@ -4858,6 +5000,17 @@ def extract_footprints_and_pads(content: str, nets: Dict[int, Net],
+             if pad_shape == 'custom':
+                 pad_polygons = _custom_pad_global_polygons(
+                     pad_text, global_x, global_y, pad_rotation)
++            elif '(chamfer' in pad_text:
++                # A chamfered rect (#1450): its cut corners are not copper,
++                # and every consumer that reads `polygons` measures them so.
++                # Shape and ratio as pcbnew loads it (a chamfered `rect` is
++                # its roundrect).
++                _chamfered = chamfered_pad_from_text(
++                    pad_text, pad_shape, _frame_size[0], _frame_size[1],
++                    global_x, global_y, pad_rotation)
++                if _chamfered is not None:
++                    pad_polygons, roundrect_rratio = _chamfered
++                    pad_shape = 'roundrect'
+ 
+             pad = Pad(
+                 component_ref=reference,
+@@ -9080,6 +9233,10 @@ def build_pcb_data_from_board(board, guide_layer: str = "User.1",
+                                 max(x for _r in pad_polygons for x, _ in _r) - global_x,
+                                 max(y for _r in pad_polygons for _, y in _r) - global_y)
+             else:
++                # A chamfered rect (#1450): its cut corners are not copper.
++                # pcbnew's effective polygon is the outline the text parser
++                # builds (chamfered_rect_polygon), already in board mm.
++                pad_polygons = _pcbnew_chamfered_pad_polygons(pad, to_mm)
+                 # Resolve the pad rectangle into board space (keyed on the absolute
+                 # total rotation, not pad_rotation alone — see the text-parser path).
+                 size_x, size_y, rect_rotation = _resolve_pad_rect(size_x, size_y, pad_rotation)
+diff --git a/py_router/list_nets.py b/py_router/list_nets.py
+index add2e61..932e162 100644
+--- a/py_router/list_nets.py
++++ b/py_router/list_nets.py
+@@ -163,13 +163,13 @@ def read_design_rules(pcb_path):
+     net_settings.classes; membership through
+     design_rules.project_class_membership, KiCad 6's classes[].nets included)
+     or, failing that, in (net_class ...) blocks inside the .kicad_pcb. The
+-    router itself does not read these - it defaults to
+-    routing_defaults.CLEARANCE etc. - so the analysis step should read them
+-    here and pass --clearance/--track-width/--via-size/--via-drill (and the
+-    diff-pair gap) explicitly, instead of over-/under-clearancing the board.
++    router's per-net maps and the analysis tools read the same membership
++    and priority table here; DesignRules also uses the shared matcher.
+ 
+     Returns {'classes': {name: {clearance, track_width, via_diameter,
+-    via_drill, diff_pair_gap, diff_pair_width}}, 'assignments': {net: class},
++    via_drill, diff_pair_gap, diff_pair_width, priority}},
++    'assignments': {net: primary_explicit_class},
++    'explicit_memberships': {net: [class, ...]},
+     'constraints': {min_clearance, min_track_width, min_via_diameter, ...},
+     'copper_layers': int, 'effective': {...}, 'source': str}. Missing values
+     are omitted per class. 'constraints' are the DRC-enforced Board Setup minima;
+@@ -177,7 +177,8 @@ def read_design_rules(pcb_path):
+     """
+     classes = {}
+     assignments = {}
+-    patterns = []       # list of (glob_pattern, class_name) from netclass_patterns
++    explicit_memberships = {}
++    patterns = []       # list of (KiCad pattern, class_name)
+     constraints = {}
+     source = None
+ 
+@@ -187,25 +188,28 @@ def read_design_rules(pcb_path):
+             with open(pro_path, encoding='utf-8') as f:
+                 pro = json.load(f)
+             ns = pro.get('net_settings', {}) or {}
++            from netclass_resolver import project_priorities
++            priorities = project_priorities(ns)
+             for c in ns.get('classes', []) or []:
+                 name = c.get('name', 'Default')
+                 classes[name] = {k: c[k] for k in
+                                  ('clearance', 'track_width', 'via_diameter',
+                                   'via_drill', 'diff_pair_gap', 'diff_pair_width')
+                                  if k in c}
++                classes[name]['priority'] = priorities[name]
+             # Membership, every form KiCad reads, through the ONE parser
+             # DesignRules.from_project uses too: explicit netclass_assignments,
+-            # KiCad 6's classes[].nets (#1304), and the netclass_patterns globs
+-            # (the primary mechanism on many boards; consumers fnmatch net
+-            # names against them, explicit assignment wins). A net may belong
+-            # to several classes (KiCad 9 lists); normalize to a single class
+-            # name (prefer the first non-Default) so downstream consumers see
+-            # {net: classname}.
++            # KiCad 6's classes[].nets (#1304), and netclass_patterns. Preserve
++            # every explicit class: reducing the list loses per-property
++            # priority and inheritance. The old primary-name view remains for
++            # callers displaying assignments; property readers use the full map.
+             from design_rules import project_class_membership
+             _members, patterns = project_class_membership(ns)
++            explicit_memberships = _members
+             for _net, _cls in _members.items():
+-                _nd = [c for c in _cls if c and c != 'Default']
+-                assignments[_net] = _nd[0] if _nd else (_cls[0] if _cls else 'Default')
++                from netclass_resolver import ordered_members
++                _ordered = ordered_members(classes, _cls)
++                assignments[_net] = _ordered[0] if _ordered else 'Default'
+             # DRC-enforced Board Constraints (what humans actually route against).
+             rules = ((pro.get('board', {}) or {}).get('design_settings', {}) or {}).get('rules', {}) or {}
+             constraints = {k: rules[k] for k in _CONSTRAINT_FIELDS if k in rules}
+@@ -248,7 +252,10 @@ def read_design_rules(pcb_path):
+     except OSError:
+         pass
+ 
++    if not explicit_memberships:
++        explicit_memberships = {net: [name] for net, name in assignments.items()}
+     return {'classes': classes, 'assignments': assignments, 'patterns': patterns,
++            'explicit_memberships': explicit_memberships,
+             'constraints': constraints, 'copper_layers': copper_layers,
+             'effective': effective_floors(constraints, copper_layers),
+             'source': source}
+@@ -670,54 +677,24 @@ def resolve_cli_floor(pcb_path, name, explicit, fallback, flag):
+ 
+ 
+ def net_clearance_map_by_id(pcb_path, nets, design_rules=None):
+-    """Resolve each net to its net-class clearance (mm) from the sibling
+-    .kicad_pro netclasses, for the routing CLIs' cross-class clearance map.
+-
+-    KiCad's required spacing between two nets of different classes is
+-    max(classA, classB). The router carries a {net_id: class_clearance} map and
+-    prices every foreign/in-run obstacle at max(routing-side floor, that net's
+-    class clearance). This helper builds that map so route.py / route_diff.py can
+-    auto-honor the board's netclasses without a hand-written --net-clearances JSON.
+-
+-    `nets` is {net_id: net_name} (e.g. {nid: n.name for nid, n in pcb.nets.items()}).
+-    A net's classes come from BOTH the explicit ``netclass_assignments`` and every
+-    matching ``netclass_patterns`` glob (KiCad merges memberships); its effective
+-    clearance is the MAX over those classes' clearances (KiCad enforces the strictest).
+-
+-    A net is returned iff it belongs to at least one NON-Default net class -- with
+-    that class's clearance, EVEN WHEN it equals or is below the Default class
+-    clearance (#439). This is the fix for the old "eff > Default" gate, which
+-    dropped a net whose class equalled Default: on an all-0.2-classes board (zynq
+-    -- Default/ADDRES/DQ* all 0.2) the map came back EMPTY, so those nets routed
+-    at the smaller ``--clearance`` instead of their 0.2 class and shipped
+-    DRC-violating. Nets that resolve ONLY to Default are still omitted (they use
+-    the router's config.clearance = ``--clearance``, which IS the Default/routing
+-    clearance). The map value is a FLOOR the caller max()es with config.clearance,
+-    so a non-Default class BELOW ``--clearance`` is inert -- correct: ``--clearance``
+-    is the routing floor for those too. Returns {net_id: clearance_mm}.
+-
+-    Pattern matching is glob-style (KiCad ``*``/``?`` wildcards). Exotic patterns that
+-    do not translate to a glob simply fail to match -> that net falls back to
+-    config.clearance (the safe/inert direction), never over-blocked.
++    """Effective non-Default net-class clearances for routing (mm).
++
++    Membership is the union of explicit assignments and every matching
++    regex/wildcard. Each net's clearance comes from the highest-priority
++    class that defines it; max(A, B) is applied between DIFFERENT nets by
++    callers, not between the member classes of one aggregate class.
++    Default-only nets retain the caller's configured Default clearance.
+     """
++    from netclass_resolver import class_property
+     dr = design_rules if design_rules is not None else read_design_rules(pcb_path)
+     classes = dr.get('classes') or {}
+-
+-    def _class_clr(cname):
+-        c = classes.get(cname) or {}
+-        v = c.get('clearance')
+-        return float(v) if isinstance(v, (int, float)) else None
+-
+     out = {}
+-    for nid, cand in net_class_memberships(pcb_path, nets,
+-                                           design_rules=dr).items():
+-        # Only NON-Default class memberships matter: a Default-only net routes at
+-        # config.clearance. Take the strictest (max) NON-Default class clearance.
+-        clrs = [c for c in (_class_clr(cn) for cn in cand if cn != 'Default')
+-                if c is not None]
+-        if not clrs:
++    for nid, members in net_class_memberships(pcb_path, nets, dr).items():
++        if not any(name != 'Default' for name in members):
+             continue
+-        out[nid] = max(clrs)
++        value = class_property(classes, members, 'clearance')
++        if value is not None:
++            out[nid] = value
+     return out
+ 
+ 
+@@ -753,102 +730,57 @@ def net_clearance_map_by_name(nets, name_to_clr):
+ 
+ 
+ def net_class_memberships(pcb_path, nets, design_rules=None):
+-    """{net_id: set of net-class names} from the sibling .kicad_pro: the
+-    explicit ``netclass_assignments`` entry UNION every matching
+-    ``netclass_patterns`` glob (KiCad merges memberships). The SHARED membership
+-    resolver -- net_clearance_map_by_id and the .kicad_dru track-clearance
+-    channel both resolve through this, so router and grader cannot drift on who
+-    is in a class. Nets with no membership are omitted (not mapped to set()).
+-
+-    Pattern matching is glob-style; an exotic pattern that does not translate
+-    simply fails to match (safe/inert direction)."""
+-    import fnmatch
++    """All explicit and regex/wildcard net-class memberships.
++
++    Both this map and DesignRules use the same matcher. Unsupported pattern
++    syntax raises explicitly; it must not silently turn a net into Default.
++    Undefined class labels remain members and inherit Default properties.
++    """
++    from netclass_resolver import resolve_memberships
+     dr = design_rules if design_rules is not None else read_design_rules(pcb_path)
+-    assignments = dr.get('assignments') or {}
+-    patterns = dr.get('patterns') or []
+-    out = {}
+-    for nid, name in nets.items():
+-        if not name:
+-            continue
+-        cand = set()
+-        a = assignments.get(name)
+-        if a:
+-            cand.add(a)
+-        for pat, cname in patterns:
+-            if not pat:
+-                continue  # empty pattern = the Default catch-all
+-            try:
+-                if fnmatch.fnmatchcase(name, pat):
+-                    cand.add(cname)
+-            except Exception:
+-                pass
+-        if cand:
+-            out[nid] = cand
+-    return out
++    assignments = dr.get('explicit_memberships', dr.get('assignments') or {})
++    return {nid: set(members) for nid, members in resolve_memberships(
++        nets, assignments, dr.get('patterns') or []).items()}
+ 
+ 
+ def net_track_width_map_by_id(pcb_path, nets, design_rules=None):
+-    """Resolve each net to its net-class TRACK WIDTH (mm) -- the single-ended
+-    companion to net_clearance_map_by_id, so route.py can route each net at its OWN
+-    class width when --track-width is omitted (a controlled-impedance signal class or
+-    a power class, each with a different width). Unlike clearance (KiCad enforces the
+-    strictest max), a net's width is the width of its ASSIGNED class, so this uses
+-    resolve_net_class (explicit assignment, else the first matching pattern).
+-
+-    `nets` is {net_id: net_name}. Returns {net_id: width_mm} for nets whose resolved
+-    class is NON-Default AND defines a track_width (Default-only nets use
+-    config.track_width = the board Default class width already). Empty when the board
+-    has no netclass widths. The caller floors each value at the fab minimum."""
++    """Effective aggregate track widths for non-Default memberships (mm)."""
++    from netclass_resolver import class_property
+     dr = design_rules if design_rules is not None else read_design_rules(pcb_path)
+-    classes = dr.get('classes') or {}
+-    if not classes:
+-        return {}
+     out = {}
+-    for nid, name in nets.items():
+-        if not name:
++    for nid, members in net_class_memberships(pcb_path, nets, dr).items():
++        if not any(name != 'Default' for name in members):
+             continue
+-        cname = resolve_net_class(name, dr)
+-        if cname == 'Default':
+-            continue
+-        w = (classes.get(cname) or {}).get('track_width')
+-        if isinstance(w, (int, float)):
+-            out[nid] = float(w)
++        value = class_property(dr.get('classes') or {}, members, 'track_width')
++        if value is not None:
++            out[nid] = value
+     return out
+ 
+ 
+ def resolve_net_class(net_name, rules):
+-    """Class name for a net under `rules` (a read_design_rules() result):
+-    explicit assignment wins, else the first matching wildcard pattern
+-    (KiCad 8+ netclass_patterns), else 'Default'."""
+-    cls = rules.get('assignments', {}).get(net_name)
+-    if cls:
+-        return cls
+-    for pattern, pcls in rules.get('patterns', []):
+-        if fnmatchcase(net_name, pattern):
+-            return pcls
+-    return 'Default'
++    """Highest-priority member name, with explicit and pattern classes merged.
++
++    Property readers must use class_property: another constituent can supply
++    a property the primary class leaves unset.
++    """
++    from netclass_resolver import ordered_members
++    members = net_class_memberships('', {1: net_name}, rules).get(1, ())
++    ordered = ordered_members(rules.get('classes') or {}, members)
++    return ordered[0] if ordered else 'Default'
+ 
+ 
+ def net_clearance_map(pcb_path, net_names, rules=None):
+-    """Per-net netclass clearance for #326 grading/routing parity.
+-
+-    Returns {net_name: clearance_mm} for every net in `net_names` whose
+-    resolved class defines a clearance -- including Default, so the caller
+-    can max() it with its own global value. Empty dict when the board has
+-    no netclass data. Pass a read_design_rules() result via `rules` to
+-    avoid re-reading."""
+-    if rules is None:
+-        rules = read_design_rules(pcb_path)
+-    classes = rules.get('classes', {})
+-    if not classes:
+-        return {}
++    """Effective aggregate clearance per net name, including Default (mm)."""
++    from netclass_resolver import class_property
++    dr = rules if rules is not None else read_design_rules(pcb_path)
++    names = {i: name for i, name in enumerate(net_names) if name}
++    memberships = net_class_memberships(pcb_path, names, dr)
+     out = {}
+-    for name in net_names:
+-        if not name:
+-            continue
+-        cl = classes.get(resolve_net_class(name, rules), {}).get('clearance')
+-        if cl:
+-            out[name] = float(cl)
++    for nid, name in names.items():
++        value = class_property(dr.get('classes') or {}, memberships.get(nid, ()),
++                               'clearance')
++        if value is not None:
++            out[name] = value
+     return out
+ 
+ 
+diff --git a/py_router/route.py b/py_router/route.py
+index 91347c2..7b58235 100644
+--- a/py_router/route.py
++++ b/py_router/route.py
+@@ -9050,6 +9050,10 @@ For differential pair routing, use route_diff.py:
+                         help="Output KiCad PCB file (named alias for the positional output_file)")
+     parser.add_argument("net_patterns", nargs="*", help="Net names or wildcard patterns to route (default: '*' = all nets)")
+     parser.add_argument("--nets", "-n", nargs="+", help="Net names or wildcard patterns to route (alternative to positional args)")
++    parser.add_argument("--literal-nets", action="store_true",
++                        help="Treat positional nets and --nets as exact full net names; "
++                             "requires explicit names and rejects unknown names. "
++                             "No wildcard, exclusion, or hierarchical leaf-name expansion.")
+     parser.add_argument("--overwrite", "-O", action="store_true",
+                         help="Overwrite input file instead of creating _routed copy")
+     parser.add_argument("--component", "-C", nargs="+", metavar="REF",
+@@ -9654,7 +9658,13 @@ For differential pair routing, use route_diff.py:
+     all_patterns = list(args.net_patterns) if args.net_patterns else []
+     if args.nets:
+         all_patterns.extend(args.nets)
+-    all_patterns = [p.strip() for p in all_patterns if p.strip()]
++    if args.literal_nets:
++        if not all_patterns:
++            parser.error("--literal-nets requires explicit net names (--nets or positional names)")
++        # Exact callers may select names containing whitespace or glob syntax.
++        # Do not normalize their spelling or imply a board-wide '*' scope.
++    else:
++        all_patterns = [p.strip() for p in all_patterns if p.strip()]
+ 
+     # --force-reroute rips every selected net; without an explicit scope the
+     # default-'*' below would silently select the WHOLE BOARD for rip+reroute.
+@@ -9698,7 +9708,16 @@ For differential pair routing, use route_diff.py:
+ 
+     # Get nets from patterns and/or component
+     if all_patterns:
+-        net_names = expand_net_patterns(pcb_data, all_patterns)
++        if args.literal_nets:
++            requested = list(dict.fromkeys(all_patterns))
++            resolved = {name for name, _ in resolve_net_ids(pcb_data, requested) if name}
++            unknown = [name for name in requested if name not in resolved]
++            if unknown:
++                parser.error("--literal-nets names do not exist on this board: "
++                             + ", ".join(repr(name) for name in unknown))
++            net_names = requested
++        else:
++            net_names = expand_net_patterns(pcb_data, all_patterns)
+     else:
+         net_names = []  # Will be populated by component filter below
+ 
+diff --git a/py_router/routing_config.py b/py_router/routing_config.py
+index dbf834c..0a737bc 100644
+--- a/py_router/routing_config.py
++++ b/py_router/routing_config.py
+@@ -122,6 +122,8 @@ class GridRouteConfig:
+     grid_step: float = 0.1  # mm grid resolution
+     via_cost: int = 75  # grid steps equivalent penalty for via (#586: 50 -> 75)
+     layers: List[str] = field(default_factory=lambda: ['F.Cu', 'B.Cu'])
++    local_max_new_vias: Optional[int] = None
++    local_via_budget_bounds: Optional[Tuple[int, int, int, int]] = None
+     max_iterations: int = 200000
+     max_probe_iterations: int = 5000  # Quick probe per direction to detect stuck routes
+     heuristic_weight: float = 2.3  # (#586: 1.9 -> 2.3, corpus dose-response peak)
+diff --git a/py_router/single_ended_routing.py b/py_router/single_ended_routing.py
+index 5b9f471..df50d01 100644
+--- a/py_router/single_ended_routing.py
++++ b/py_router/single_ended_routing.py
+@@ -2252,6 +2252,10 @@ def _route_net_with_obstacles_impl(pcb_data: PCBData, net_id: int, config: GridR
+                         attraction_cross_layer_pct=bus_xlayer_pct,
+                         attraction_potential=env_knobs.GLOBAL_PLAN.get('attract_potential', 0))
+ 
++    if getattr(config, 'local_max_new_vias', None) is not None:
++        router.set_max_new_vias(config.local_max_new_vias)
++        router.set_via_budget_bounds(config.local_via_budget_bounds)
++
+     # Set attraction path for bus routing (if provided)
+     if attraction_path:
+         router.set_attraction_path(attraction_path)
+@@ -3844,7 +3848,10 @@ def _pour_launch_region_cells(pcb_data, net_id, pad_info, pad_components,
+     out = {}
+     _bare_kept = 0
+     try:
+-        _zones = [z for z in (pcb_data.zones or []) if z.net_id == net_id
++        from kicad_parser import pour_zones
++        # Generated teardrops can disappear when their parent track is removed
++        # and KiCad refills. They are not persistent pour launch terminals.
++        _zones = [z for z in pour_zones(pcb_data.zones) if z.net_id == net_id
+                   and z.layer in layer_names]
+         for _z in _zones:
+             _m = get_zone_model(pcb_data, _z)
+@@ -3966,7 +3973,9 @@ def _pour_launch_pair_anchors(pcb_data, net_id, sources, targets,
+         import numpy as _np
+     except Exception:
+         return [], []
+-    _zones = [z for z in (getattr(pcb_data, 'zones', None) or [])
++    from kicad_parser import pour_zones
++    # A stale teardrop must not replace the pad/track endpoint it used to join.
++    _zones = [z for z in pour_zones(getattr(pcb_data, 'zones', None))
+               if z.net_id == net_id and z.layer in layer_names]
+     if not _zones:
+         return [], []
+diff --git a/rust_router/src/router.rs b/rust_router/src/router.rs
+index 10d87b4..6e14e5e 100644
+--- a/rust_router/src/router.rs
++++ b/rust_router/src/router.rs
+@@ -2,7 +2,7 @@
+ 
+ use pyo3::prelude::*;
+ use rustc_hash::{FxHashMap, FxHashSet};
+-use std::collections::BinaryHeap;
++use std::collections::{BinaryHeap, VecDeque};
+ 
+ use crate::obstacle_map::GridObstacleMap;
+ use crate::types::{GridState, OpenEntry, RouteStats, SearchSink, StatsSink, FrontierSink, DIRECTIONS, ORTHO_COST, DIAG_COST, DEFAULT_TURN_COST};
+@@ -67,11 +67,12 @@ pub(crate) struct NodeStore {
+     tiles: Vec<Tile>,
+     index: FxHashMap<u64, u32>, // tile key -> index into tiles
+     closed_count: u32,
++    labels: Option<BudgetLabels>,
+ }
+ 
+ impl NodeStore {
+     fn new() -> Self {
+-        Self { tiles: Vec::new(), index: FxHashMap::default(), closed_count: 0 }
++        Self { tiles: Vec::new(), index: FxHashMap::default(), closed_count: 0, labels: None }
+     }
+ 
+     /// Tile hash key: the tile coordinates reuse GridState's 20/20/8 packing
+@@ -125,17 +126,20 @@ impl NodeStore {
+ 
+     #[inline]
+     fn slot(&self, idx: u32) -> &NodeSlot {
++        if let Some(labels) = &self.labels { return &labels.nodes[idx as usize].slot; }
+         &self.tiles[(idx / TILE_CELLS) as usize].slots[(idx % TILE_CELLS) as usize]
+     }
+ 
+     #[inline]
+     fn slot_mut(&mut self, idx: u32) -> &mut NodeSlot {
++        if let Some(labels) = &mut self.labels { return &mut labels.nodes[idx as usize].slot; }
+         &mut self.tiles[(idx / TILE_CELLS) as usize].slots[(idx % TILE_CELLS) as usize]
+     }
+ 
+     /// Cell coordinates of a node index (path reconstruction / parent walks).
+     #[inline]
+     fn coords(&self, idx: u32) -> (i32, i32, u8) {
++        if let Some(labels) = &self.labels { return labels.nodes[idx as usize].position; }
+         let tile = &self.tiles[(idx / TILE_CELLS) as usize];
+         let s = (idx % TILE_CELLS) as i32;
+         (tile.base_x + (s & TILE_MASK), tile.base_y + (s >> TILE_BITS), tile.layer)
+@@ -203,6 +207,102 @@ impl NodeStore {
+ }
+ 
+ 
++
++// Resource-constrained search, inspired by J-Kreisel/kicad-autorouter's
++// cost/via Pareto frontier. This implementation retains heading and constrained
++// prefix/history context because KRT's successor legality is path-dependent.
++#[derive(Clone, Debug, Eq, PartialEq, Hash)]
++struct BudgetContext {
++    position: (i32, i32, u8),
++    directions: Vec<(i32, i32, i32)>,
++    start_phase: i32,
++    via_history: Vec<(i32, i32)>,
++}
++struct BudgetNode {
++    position: (i32, i32, u8),
++    slot: NodeSlot,
++    vias: u32,
++    dominated: bool,
++    heading: (i32,i32),
++}
++#[derive(Default)]
++struct BudgetLabels {
++    nodes: Vec<BudgetNode>,
++    frontier: FxHashMap<BudgetContext, Vec<u32>>,
++}
++impl NodeStore {
++    fn via_count(&self, idx: u32) -> u32 {
++        self.labels.as_ref().map_or(0, |l| l.nodes[idx as usize].vias)
++    }
++    fn is_dominated(&self, idx: u32) -> bool {
++        self.labels.as_ref().map_or(false, |l| l.nodes[idx as usize].dominated)
++    }
++    #[allow(clippy::too_many_arguments)]
++    fn propose(&mut self, x: i32, y: i32, layer: u8, g: i32,
++               parent: Option<u32>, steps: i32, vias: u32,
++               history: &[(i32, i32)], opts: &SearchOptions, turn_cost: i32) -> Option<u32> {
++        if self.labels.is_none() {
++            if parent.is_none() {
++                self.set_source(x,y,layer,g);
++                return Some(self.ensure_index(x,y,layer));
++            }
++            let (old,closed) = self.g_closed_at(x,y,layer);
++            if closed || old <= g { return None; }
++            match parent {
++                Some(p) => self.relax(x,y,layer,g,p,steps),
++                None => self.set_source(x,y,layer,g),
++            }
++            return Some(self.ensure_index(x,y,layer));
++        }
++        let mut directions = Vec::new();
++        let mut cursor = parent;
++        let mut pos = (x,y,layer);
++        // Collinear-via constraints inspect four previous edges; ordinary
++        // turn cost and arrival legality inspect only the immediate heading.
++        for _ in 0..if opts.collinear_vias { 4 } else { 1 } {
++            if let Some(p) = cursor {
++                let previous = self.coords(p);
++                directions.push(((pos.0-previous.0).signum(),(pos.1-previous.1).signum(),
++                                 if pos.2 == previous.2 { 0 } else { 1 }));
++                cursor = self.parent(p); pos = previous;
++            } else { break; }
++        }
++        // Cross-heading dominance is safe only when no future directional
++        // legality depends on that heading. Account for the worst extra turn
++        // cost before allowing a cheaper label to subsume another heading.
++        let heading = directions.first().map_or((0,0), |p| (p.0,p.1));
++        let compare_headings = !opts.collinear_vias && opts.norm_end_dir.is_none()
++            && turn_cost >= 0 && directions.len()==1 && directions[0].2==0;
++        if compare_headings { directions[0]=(0,0,0); }
++        let turn_difference = |a:(i32,i32),b:(i32,i32)| -> i32 {
++            if !compare_headings || a==b { return 0; }
++            let delta=(octant_index(a.0,a.1)-octant_index(b.0,b.1)).rem_euclid(8);
++            ((turn_cost as i64 * delta.min(8-delta) as i64 + 1)/2).min(i32::MAX as i64) as i32
++        };
++        let mut via_history = history.to_vec();
++        via_history.sort_unstable(); via_history.dedup();
++        let context = BudgetContext { position:(x,y,layer), directions,
++            start_phase: if opts.norm_start_dir.is_some() { steps.min(opts.direction_steps) } else {0},
++            via_history };
++        let labels = self.labels.as_mut().unwrap();
++        let frontier = labels.frontier.entry(context).or_default();
++        if frontier.iter().any(|&i| {
++            let n=&labels.nodes[i as usize]; n.vias<=vias && n.slot.g.saturating_add(turn_difference(n.heading,heading))<=g
++        }) { return None; }
++        frontier.retain(|&i| {
++            let n=&mut labels.nodes[i as usize];
++            if n.vias>=vias && n.slot.g>=g.saturating_add(turn_difference(n.heading,heading)) { n.dominated=true; false } else { true }
++        });
++        // Parent indices reserve the top bit for closed. Bounded iteration
++        // limits keep this far below the cap; fail closed if ever exceeded.
++        if labels.nodes.len() >= NO_PARENT32 as usize { return None; }
++        let idx=labels.nodes.len() as u32;
++        labels.nodes.push(BudgetNode {position:(x,y,layer), vias, dominated:false, heading,
++            slot:NodeSlot {g,parent:parent.unwrap_or(NO_PARENT32),steps}});
++        frontier.push(idx); Some(idx)
++    }
++}
++
+ /// Outcome of one GridSearch step (one open-set pop).
+ pub(crate) enum SearchStep {
+     /// A node was expanded normally.
+@@ -373,7 +473,9 @@ impl TargetHint {
+ pub(crate) struct GridSearch {
+     pub(crate) open_set: BinaryHeap<OpenEntry>,
+     pub(crate) store: NodeStore,
+-    path_vias: FxHashMap<u64, Vec<(i32, i32)>>,
++    path_vias: FxHashMap<u32, Vec<(i32, i32)>>,
++    zero_via_reachable: Option<FxHashSet<u64>>,
++    zero_via_prepared: bool,
+     counter: u32,
+     pub(crate) iterations: u32,
+     pub(crate) max_iterations: u32,
+@@ -437,9 +539,10 @@ impl GridSearch {
+ 
+         let mut open_set = BinaryHeap::new();
+         let mut store = NodeStore::new();
++        if router.max_new_vias.is_some() { store.labels = Some(BudgetLabels::default()); }
+         // Track via positions for each node's path (only if via_exclusion_radius > 0):
+         // node key -> list of (gx, gy) via positions on the path to that node
+-        let mut path_vias: FxHashMap<u64, Vec<(i32, i32)>> = FxHashMap::default();
++        let mut path_vias: FxHashMap<u32, Vec<(i32, i32)>> = FxHashMap::default();
+         let mut counter: u32 = 0;
+ 
+         // Find minimum layer cost for the initial g penalty (A1: FORBIDDEN
+@@ -449,13 +552,14 @@ impl GridSearch {
+ 
+         for (gx, gy, layer) in sources {
+             let state = GridState::new(gx, gy, layer);
+-            let key = state.as_key();
+             // Penalize starting on expensive layers
+             let layer_cost = router.layer_cost_or_default(layer as usize);
+             let initial_g = layer_cost - min_layer_cost;
+             let h = router.heuristic_to_targets(&state, &target_states, &target_hint);
+             initial_h = initial_h.min(h);
++            let Some(node_idx) = store.propose(gx, gy, layer, initial_g, None, 0, 0, &[], &opts, router.turn_cost) else { continue; };
+             open_set.push(OpenEntry {
++                node_idx,
+                 f_score: initial_g.saturating_add(h),
+                 g_score: initial_g,
+                 state,
+@@ -463,10 +567,9 @@ impl GridSearch {
+             });
+             counter += 1;
+             sink.on_push();
+-            store.set_source(gx, gy, layer, initial_g);
+             // Source nodes start with no vias on their path
+             if opts.via_exclusion_radius > 0 {
+-                path_vias.insert(key, Vec::new());
++                path_vias.insert(node_idx, Vec::new());
+             }
+         }
+ 
+@@ -480,6 +583,8 @@ impl GridSearch {
+             open_set,
+             store,
+             path_vias,
++            zero_via_reachable: None,
++            zero_via_prepared: false,
+             counter,
+             iterations: 0,
+             max_iterations,
+@@ -558,6 +663,12 @@ impl GridSearch {
+         obstacles: &GridObstacleMap,
+         sink: &mut S,
+     ) -> SearchStep {
++        if !self.zero_via_prepared {
++            self.zero_via_prepared = true;
++            if router.max_new_vias.is_some() {
++                self.zero_via_reachable = router.zero_via_reachable(obstacles, &self.target_states, &self.opts);
++            }
++        }
+         let current_entry = match self.open_set.pop() {
+             Some(e) => e,
+             None => return SearchStep::Exhausted,
+@@ -575,13 +686,28 @@ impl GridSearch {
+ 
+         let current = current_entry.state;
+         let current_key = current.as_key();
+-        let current_idx = self.store.ensure_index(current.gx, current.gy, current.layer);
++        let current_idx = current_entry.node_idx;
+         let g = current_entry.g_score;
+ 
+-        if self.store.is_closed(current_idx) {
++        if self.store.is_closed(current_idx) || self.store.is_dominated(current_idx) || (self.store.labels.is_some() && g != self.store.slot(current_idx).g) {
+             sink.on_duplicate_skip();
+             return SearchStep::Skipped;
+         }
++        // Once the budget is spent, only the optimistic zero-new-hole
++        // component can lead to a target. Ignore turn/exclusion constraints
++        // in the reverse flood: it may retain impossible nodes, never remove
++        // a legal one. Existing same-net free barrels remain traversable.
++        let just_changed_layer = self.store.parent(current_idx).map_or(false, |p| {
++            let (x,y,l)=self.store.coords(p); x==current.gx && y==current.gy && l!=current.layer
++        });
++        if !just_changed_layer && router.max_new_vias == Some(self.store.via_count(current_idx)) {
++            if let Some(reachable) = &self.zero_via_reachable {
++                if !reachable.contains(&current_key) {
++                    self.store.set_closed(current_idx);
++                    return SearchStep::Skipped;
++                }
++            }
++        }
+         sink.on_expand();
+ 
+         // #529 closest approach: h = f - g of the expanded node is its
+@@ -638,7 +764,7 @@ impl GridSearch {
+ 
+         // Current node's via list for exclusion checking
+         let current_vias: Vec<(i32, i32)> = if self.opts.via_exclusion_radius > 0 {
+-            self.path_vias.get(&current_key).cloned().unwrap_or_default()
++            self.path_vias.get(&current_idx).cloned().unwrap_or_default()
+         } else {
+             Vec::new()
+         };
+@@ -699,13 +825,8 @@ impl GridSearch {
+                 }
+ 
+                 let neighbor = GridState::new(ngx, ngy, current.layer);
+-                let neighbor_key = neighbor.as_key();
+-
+-                let (existing_g, neighbor_closed) = self.store.g_closed_at(ngx, ngy, current.layer);
+-                if neighbor_closed {
+-                    continue;
+-                }
+ 
++                if self.store.labels.is_none() && self.store.g_closed_at(ngx, ngy, current.layer).1 { continue; }
+                 let base_move_cost = if dx != 0 && dy != 0 { DIAG_COST } else { ORTHO_COST };
+                 // Apply layer cost multiplier (1000 = 1.0x, 1500 = 1.5x, etc.)
+                 let layer_multiplier = router.layer_cost_or_default(current.layer as usize);
+@@ -783,17 +904,18 @@ impl GridSearch {
+                 } else { step_cost };
+                 let new_g = g + step_cost;
+ 
+-                if new_g < existing_g {
+-                    if existing_g != i32::MAX {
+-                        sink.on_revisit();
+-                    }
+-                    self.store.relax(ngx, ngy, current.layer, new_g, current_idx, current_steps + 1);
++                let old_g = if self.store.labels.is_none() { self.store.g_closed_at(ngx, ngy, current.layer).0 } else { i32::MAX };
++                if let Some(node_idx) = self.store.propose(ngx, ngy, current.layer, new_g,
++                        Some(current_idx), current_steps + 1, self.store.via_count(current_idx),
++                        &current_vias, &self.opts, router.turn_cost) {
++                    if old_g != i32::MAX { sink.on_revisit(); }
+                     // Propagate via list to neighbor (same vias since no layer change)
+                     if self.opts.via_exclusion_radius > 0 {
+-                        self.path_vias.insert(neighbor_key, current_vias.clone());
++                        self.path_vias.insert(node_idx, current_vias.clone());
+                     }
+                     let h = router.heuristic_to_targets(&neighbor, &self.target_states, &self.target_hint);
+                     self.open_set.push(OpenEntry {
++                        node_idx,
+                         f_score: new_g.saturating_add(h), // B4: no i32 wrap on huge h
+                         g_score: new_g,
+                         state: neighbor,
+@@ -860,6 +982,17 @@ impl GridSearch {
+         // skipped before is_free_via is ever read -- forcing a redundant via to be
+         // dropped a couple cells away beside a perfectly good via-in-pad.
+         let free_here = obstacles.is_free_via(current.gx, current.gy);
++        // Count non-free transitions conservatively. Consecutive changes at one
++        // site represent one through-hole; existing free barrels cost no resource.
++        let same_site_transition = self.store.parent(current_idx).map_or(false, |p| {
++            let (x,y,l) = self.store.coords(p);
++            x == current.gx && y == current.gy && l != current.layer
++        });
++        let next_vias = self.store.via_count(current_idx).saturating_add(
++            if free_here || same_site_transition { 0 } else { 1 });
++        if router.max_new_vias.map_or(false, |limit| next_vias > limit) {
++            return SearchStep::Progress;
++        }
+         if can_place_via && (!via_too_close || free_here)
+             && (!obstacles.is_via_blocked_rung(current.gx, current.gy, self.opts.via_rung) || free_here) {
+             for layer in 0..obstacles.num_layers as u8 {
+@@ -879,13 +1012,8 @@ impl GridSearch {
+                 }
+ 
+                 let neighbor = GridState::new(current.gx, current.gy, layer);
+-                let neighbor_key = neighbor.as_key();
+-
+-                let (existing_g, neighbor_closed) = self.store.g_closed_at(current.gx, current.gy, layer);
+-                if neighbor_closed {
+-                    continue;
+-                }
+ 
++                if self.store.labels.is_none() && self.store.g_closed_at(current.gx, current.gy, layer).1 { continue; }
+                 // Zero cost for free via positions (through-hole pads on same net).
+                 // S6: is_free_via was recomputed for every destination layer;
+                 // free_here is loop-invariant, reuse it.
+@@ -912,23 +1040,20 @@ impl GridSearch {
+                 } else { 0 };
+                 let new_g = g + (combined_via_cost + proximity_cost - via_shaping).max(0);
+ 
+-                if new_g < existing_g {
+-                    if existing_g != i32::MAX {
+-                        sink.on_revisit();
+-                    }
+-                    self.store.relax(current.gx, current.gy, layer, new_g, current_idx, current_steps);
+-                    // Track via positions (only real vias, not free vias at through-holes)
++                let mut next_history = current_vias.clone();
++                if self.opts.via_exclusion_radius > 0 && !free_here && !same_site_transition {
++                    next_history.push((current.gx, current.gy));
++                }
++                let old_g = if self.store.labels.is_none() { self.store.g_closed_at(current.gx, current.gy, layer).0 } else { i32::MAX };
++                if let Some(node_idx) = self.store.propose(current.gx, current.gy, layer, new_g,
++                        Some(current_idx), current_steps, next_vias, &next_history, &self.opts, router.turn_cost) {
++                    if old_g != i32::MAX { sink.on_revisit(); }
+                     if self.opts.via_exclusion_radius > 0 {
+-                        if free_here {
+-                            self.path_vias.insert(neighbor_key, current_vias.clone());
+-                        } else {
+-                            let mut new_vias = current_vias.clone();
+-                            new_vias.push((current.gx, current.gy));
+-                            self.path_vias.insert(neighbor_key, new_vias);
+-                        }
++                        self.path_vias.insert(node_idx, next_history);
+                     }
+                     let h = router.heuristic_to_targets(&neighbor, &self.target_states, &self.target_hint);
+                     self.open_set.push(OpenEntry {
++                        node_idx,
+                         f_score: new_g.saturating_add(h), // B4: no i32 wrap on huge h
+                         g_score: new_g,
+                         state: neighbor,
+@@ -948,6 +1073,8 @@ impl GridSearch {
+ #[pyclass]
+ pub struct GridRouter {
+     via_cost: i32,
++    max_new_vias: Option<u32>,
++    via_budget_bounds: Option<(i32,i32,i32,i32)>,
+     h_weight: f32,
+     turn_cost: i32,
+     via_proximity_cost: i32,  // Multiplier on graded proximity cost when placing vias (0 = no extra cost)
+@@ -999,6 +1126,8 @@ impl GridRouter {
+                attraction_cross_layer_pct: i32, attraction_potential: i32) -> Self {
+         Self {
+             via_cost,
++            max_new_vias: None,
++            via_budget_bounds: None,
+             h_weight,
+             turn_cost: turn_cost.unwrap_or(DEFAULT_TURN_COST),
+             via_proximity_cost: via_proximity_cost.unwrap_or(1),
+@@ -1017,6 +1146,20 @@ impl GridRouter {
+         }
+     }
+ 
++    /// Opt into resource-labelled search. None retains the upstream search.
++    /// Counts non-free layer transitions (same-site consecutive transitions
++    /// share one through-hole). Revisiting a new site after travelling away is
++    /// conservatively counted again; no exhaustive feasibility claim is made.
++    #[pyo3(signature = (limit=None))]
++    pub fn set_max_new_vias(&mut self, limit: Option<u32>) { self.max_new_vias = limit; }
++
++    /// Optional authorized grid bounds enable an optimistic no-new-via
++    /// reachability prune. Supplying bounds does not grant routing permission.
++    #[pyo3(signature = (bounds=None))]
++    pub fn set_via_budget_bounds(&mut self, bounds: Option<(i32,i32,i32,i32)>) {
++        self.via_budget_bounds = bounds;
++    }
++
+     /// Set the proximity heuristic cost for subsequent routes.
+     /// Call this before each route to adjust based on whether endpoints are in proximity zones.
+     pub fn set_proximity_heuristic_cost(&mut self, cost: i32) {
+@@ -1653,3 +1796,43 @@ impl GridRouter {
+         dict
+     }
+ }
++
++impl GridRouter {
++    fn zero_via_reachable(&self, obstacles: &GridObstacleMap, targets: &[GridState],
++                          opts: &SearchOptions) -> Option<FxHashSet<u64>> {
++        let (xmin,ymin,xmax,ymax) = self.via_budget_bounds?;
++        if xmin>xmax || ymin>ymax || targets.iter().any(|p| p.gx<xmin || p.gx>xmax || p.gy<ymin || p.gy>ymax) {
++            return None;
++        }
++        // Bound preprocessing memory without treating a large search as
++        // unsupported. Above this cap, simply omit this optional prune.
++        let cells=(xmax as i64-xmin as i64+1).checked_mul(ymax as i64-ymin as i64+1)?;
++        if cells.checked_mul(obstacles.num_layers as i64)? > 2_000_000 { return None; }
++        let mut seen=FxHashSet::default(); let mut queue=VecDeque::new();
++        for &target in targets {
++            if seen.insert(target.as_key()) { queue.push_back(target); }
++        }
++        while let Some(current)=queue.pop_front() {
++            for (dx,dy) in DIRECTIONS {
++                let x=current.gx+dx; let y=current.gy+dy;
++                if x<xmin || x>xmax || y<ymin || y>ymax || self.layer_forbidden(current.layer as usize) {continue;}
++                let next=GridState::new(x,y,current.layer);
++                if seen.contains(&next.as_key()) {continue;}
++                if !obstacles.segment_blocked(x,y,current.gx,current.gy,current.layer as usize,opts.track_margin.at(current.layer as usize)) {
++                    seen.insert(next.as_key());queue.push_back(next);
++                }
++            }
++            if obstacles.is_free_via(current.gx,current.gy) && !self.layer_forbidden(current.layer as usize) {
++                for layer in 0..obstacles.num_layers as u8 {
++                    if layer==current.layer {continue;}
++                    let next=GridState::new(current.gx,current.gy,layer);
++                    if seen.contains(&next.as_key()) {continue;}
++                    if !obstacles.segment_blocked(current.gx,current.gy,current.gx,current.gy,current.layer as usize,opts.track_margin.at(current.layer as usize)) {
++                        seen.insert(next.as_key());queue.push_back(next);
++                    }
++                }
++            }
++        }
++        Some(seen)
++    }
++}
+diff --git a/rust_router/src/types.rs b/rust_router/src/types.rs
+index d296360..dd6a63a 100644
+--- a/rust_router/src/types.rs
++++ b/rust_router/src/types.rs
+@@ -63,6 +63,7 @@ pub struct OpenEntry {
+     pub f_score: i32,
+     pub g_score: i32,
+     pub state: GridState,
++    pub node_idx: u32, // Immutable resource label, or legacy tiled node index.
+     pub counter: u32, // Tie-breaker for deterministic ordering
+ }
+ 
+diff --git a/py_router/netclass_resolver.py b/py_router/netclass_resolver.py
+new file mode 100644
+index 0000000..2403bf0
+--- /dev/null
++++ b/py_router/netclass_resolver.py
+@@ -0,0 +1,117 @@
++"""Shared KiCad 10 net-class pattern and per-property aggregation semantics.
++
++KiCad CTX_NETCLASS uses anchored regex OR anchored * / ? wildcards. It is
++not shell fnmatch: square brackets are literal in the wildcard branch.
++All explicit and pattern memberships participate; lowest numeric priority,
++then alphabetical name, wins each defined property. Default fills holes.
++
++The regex subset here uses Python's engine. POSIX-specific classes, word
++boundaries, extensions and formatted/group buses are rejected explicitly,
++not silently treated as a nonmatch. Native preflight remains authoritative.
++"""
++from functools import lru_cache
++import math
++import re
++
++DEFAULT_PRIORITY = 2147483647
++
++
++class UnsupportedNetclassPattern(ValueError):
++    pass
++
++
++def project_priorities(net_settings):
++    """KiCad's schema 3 -> 4 migration replaces priorities in file order."""
++    meta = net_settings.get('meta') or {}
++    version = meta.get('version')
++    migrate = isinstance(version, int) and not isinstance(version, bool) and version <= 3
++    result, ordinal = {}, 0
++    for entry in net_settings.get('classes') or []:
++        name = entry.get('name', 'Default')
++        fallback = DEFAULT_PRIORITY if name == 'Default' else ordinal
++        result[name] = fallback if migrate else int(entry.get('priority', fallback))
++        if name != 'Default':
++            ordinal += 1
++    return result
++
++
++@lru_cache(maxsize=1024)
++def expanded_patterns(pattern):
++    if not isinstance(pattern, str):
++        raise UnsupportedNetclassPattern('netclass pattern must be a string')
++    # Plain vector buses have an exact bounded expansion. Formatted vectors
++    # and group buses use KiCad's more extensive net-name parser.
++    vector = re.fullmatch(r'([^{}\[\]\s]+)\[(\d+)\.\.(\d+)\]', pattern)
++    if vector:
++        prefix, first, last = vector.groups()
++        first, last = sorted((int(first), int(last)))
++        if last - first > 4095:
++            raise UnsupportedNetclassPattern('netclass bus range exceeds 4096 members')
++        return tuple(prefix + str(i) for i in range(first, last + 1))
++    if re.search(r'\[\d+\.\.\d+\]', pattern) or re.search(r'\{[^{}]*\s[^{}]*\}', pattern):
++        raise UnsupportedNetclassPattern(f'formatted/group bus pattern is unsupported: {pattern!r}')
++    if (any(token in pattern for token in ('[[:', '[[.', '[[=', '(?'))
++            or re.search(r'\\[bBmMyY]', pattern) or '\n' in pattern or '\r' in pattern):
++        raise UnsupportedNetclassPattern(f'POSIX-specific/extended netclass regex is unsupported: {pattern!r}')
++    return (pattern,)
++
++
++@lru_cache(maxsize=4096)
++def _compiled(pattern):
++    expression = pattern
++    if not expression.startswith('^'):
++        expression = '^' + expression
++    if not expression.endswith('$'):
++        expression += '$'
++    try:
++        regular = re.compile(expression)
++    except re.error:
++        regular = None  # A valid wildcard can be an invalid regular expression.
++    wildcard = re.compile('^' + ''.join('.' if c == '?' else '.*' if c == '*'
++                                       else re.escape(c) for c in pattern) + '$')
++    return regular, wildcard
++
++
++def pattern_matches(name, pattern):
++    for expanded in expanded_patterns(pattern):
++        regular, wildcard = _compiled(expanded)
++        # KiCad appends ^/$ without grouping alternation, then requires a
++        # match at offset zero. Preserve that behavior rather than fullmatch.
++        if (regular is not None and regular.match(name)) or wildcard.match(name):
++            return True
++    return False
++
++
++def resolve_memberships(names, assignments, patterns):
++    # Validate even patterns that happen not to match this task's target.
++    for pattern, _ in patterns:
++        expanded_patterns(pattern)
++    result = {}
++    for nid, name in names.items():
++        if not name:
++            continue
++        assigned = assignments.get(name, ())
++        members = set([assigned] if isinstance(assigned, str) else assigned)
++        for pattern, classname in patterns:
++            if pattern_matches(name, pattern):
++                members.add(classname)
++        if members:
++            result[nid] = frozenset(members)
++    return result
++
++
++def ordered_members(classes, members):
++    def priority(name):
++        default = DEFAULT_PRIORITY if name == 'Default' else DEFAULT_PRIORITY - 1
++        return classes.get(name, {}).get('priority', default), name
++    return sorted(members, key=priority)
++
++
++def class_property(classes, members, prop):
++    for name in ordered_members(classes, members) + ['Default']:
++        value = classes.get(name, {}).get(prop)
++        if isinstance(value, (int, float)) and not isinstance(value, bool):
++            if not math.isfinite(value) or value < 0:
++                raise ValueError(f'invalid netclass {name!r} {prop}: {value!r}')
++            return float(value)  # Zero is explicitly set, not an absent property.
++    return None
+diff --git a/tests/test_literal_nets_cli.py b/tests/test_literal_nets_cli.py
+new file mode 100644
+index 0000000..3fedd83
+--- /dev/null
++++ b/tests/test_literal_nets_cli.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++"""Exercise the real CLI selector via tiny temporary-board undo operations.
++
++No path search, native DRC, downloaded fixtures, or user board writes. Undo
++makes the selected scope observable: only that net's synthetic segment goes.
++"""
++import json
++from pathlib import Path
++import re
++import subprocess
++import sys
++import tempfile
++import unittest
++import uuid
++
++ROOT = Path(__file__).resolve().parents[1]
++ROUTE = ROOT / 'py_router' / 'route.py'
++NAMES = ('DATA[0]', 'DATA0', 'DATA', '/Sheet/DATA', 'STAR*', 'STAR1',
++         'ASK?', 'ASKx', '!RESET', ' PAD ', 'GND')
++
++
++def make_board(directory):
++    board = directory / 'input.kicad_pcb'
++    rows = ['(kicad_pcb (version 20240108) (generator "literal_net_test")',
++            '(general (thickness 1.6)) (paper "A4")',
++            '(layers (0 "F.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))',
++            '(setup (pad_to_mask_clearance 0)) (net 0 "")']
++    for index, name in enumerate(NAMES, 1):
++        rows.append(f'(net {index} {json.dumps(name)})')
++        locked = ' (locked yes)' if name == 'GND' else ''
++        rows.append(f'(segment (start 2 {index}) (end 3 {index}) (width 0.2) '
++                    f'(layer "F.Cu") (net {index}) (uuid "{uuid.UUID(int=index)}"){locked})')
++    rows.append('(gr_rect (start 0 0) (end 20 20) (stroke (width 0.1) '
++                '(type default)) (fill none) (layer "Edge.Cuts")))')
++    board.write_text('\n'.join(rows)+'\n')
++    board.with_suffix('.kicad_pro').write_text(json.dumps({
++        'net_settings': {'meta': {'version': 4}, 'classes': [
++            {'name': 'Default', 'priority': 2147483647, 'track_width': .2,
++             'clearance': .2, 'via_diameter': .6, 'via_drill': .3}]}})+'\n')
++    return board
++
++
++def removed_names(before, after):
++    def track_ids(text):
++        return set(re.findall(r'\(uuid "([0-9a-f-]+)"\)', text))
++    removed = track_ids(before) - track_ids(after)
++    return {name for i, name in enumerate(NAMES, 1) if str(uuid.UUID(int=i)) in removed}
++
++
++class LiteralNetsCli(unittest.TestCase):
++    def run_cli(self, names, literal=True):
++        temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(temporary.cleanup)
++        directory = Path(temporary.name)
++        board = make_board(directory)
++        original = board.read_text()
++        project_original = board.with_suffix('.kicad_pro').read_bytes()
++        output = directory / 'output.kicad_pcb'
++        command = [sys.executable, '-B', str(ROUTE), str(board), str(output),
++                   '--undo', '--no-fix-drc-settings', '--strict-sizes']
++        if literal:
++            command.append('--literal-nets')
++        if names is not None:
++            command.extend(['--nets', *names])
++        completed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=15)
++        self.assertEqual(board.read_text(), original)
++        self.assertEqual(board.with_suffix('.kicad_pro').read_bytes(), project_original)
++        return completed, original, output
++
++    def test_full_literal_names_select_only_the_named_net(self):
++        for name in ('DATA[0]', 'DATA', '/Sheet/DATA', 'STAR*', 'ASK?', '!RESET', ' PAD '):
++            with self.subTest(name=name):
++                result, original, output = self.run_cli([name])
++                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++                self.assertEqual(removed_names(original, output.read_text()), {name})
++
++    def test_unknown_names_abort_even_with_a_known_name(self):
++        for names in (['DATA', 'UNKNOWN'], ['NO*'], ['!UNKNOWN'], ['']):
++            with self.subTest(names=names):
++                result, _, output = self.run_cli(names)
++                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
++                self.assertIn('--literal-nets names do not exist', result.stderr)
++                self.assertFalse(output.exists())
++
++    def test_literal_mode_requires_explicit_names(self):
++        result, _, output = self.run_cli(None)
++        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
++        self.assertIn('--literal-nets requires explicit net names', result.stderr)
++        self.assertFalse(output.exists())
++
++    def test_default_wildcard_and_leaf_matching_remain(self):
++        for pattern, expected in [('DATA[0]', {'DATA0'}),
++                                  ('DATA', {'DATA', '/Sheet/DATA'}),
++                                  ('STAR*', {'STAR*', 'STAR1'}),
++                                  ('ASK?', {'ASK?', 'ASKx'})]:
++            with self.subTest(pattern=pattern):
++                result, original, output = self.run_cli([pattern], literal=False)
++                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++                self.assertEqual(removed_names(original, output.read_text()), expected)
++
++    def test_literal_selection_keeps_locked_copper_protection(self):
++        result, original, output = self.run_cli(['GND'])
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++        self.assertEqual(removed_names(original, output.read_text()), set())
++        self.assertIn('KiCad-locked', result.stdout)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/test_netclass_resolution.py b/tests/test_netclass_resolution.py
+new file mode 100644
+index 0000000..d5daec0
+--- /dev/null
++++ b/tests/test_netclass_resolution.py
+@@ -0,0 +1,158 @@
++#!/usr/bin/env python3
++"""Small project fixtures for native-checked net-class matching and merging.
++
++No boards are downloaded or routed. The fixture writer is also used by the
++external native parity probe; expectations were checked on pcbnew 10.0.4.
++"""
++import json
++from pathlib import Path
++import sys
++import tempfile
++from types import SimpleNamespace
++import unittest
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'py_router'))
++
++DEFAULT = {'name': 'Default', 'priority': 2147483647, 'clearance': .2,
++           'track_width': .2, 'via_diameter': .6, 'via_drill': .3,
++           'diff_pair_width': .2, 'diff_pair_gap': .25,
++           'diff_pair_via_gap': .25, 'microvia_diameter': .3,
++           'microvia_drill': .1, 'wire_width': 6, 'bus_width': 12,
++           'line_style': 0, 'pcb_color': 'rgba(0, 0, 0, 0.000)',
++           'schematic_color': 'rgba(0, 0, 0, 0.000)'}
++EXPECTED = {
++    'regex_out2': (.31, .17),
++    'glob.7': (.32, .18),
++    'literal[2]': (.34, .19),
++    'literal2': (.34, .19),
++    'prio7': (.33, .18),
++    'merge7': (.45, .21),
++    'tie7': (.19, .16),
++    'explicit_pattern7': (.33, .18),
++    'unassigned': (.2, .2),
++    'unknown': (.2, .2),
++    'zero': (.23, 0),
++    '[broken7': (.32, .18),
++    'prefix_extra': (.31, .17),
++    'DATA0': (.31, .17),
++    'DATA2': (.31, .17),
++    'DATA3': (.2, .2),
++}
++
++
++def fixture_project():
++    classes = [DEFAULT,
++               {'name': 'Regex', 'priority': 10, 'track_width': .31, 'clearance': .17},
++               {'name': 'Glob', 'priority': 10, 'track_width': .32, 'clearance': .18},
++               {'name': 'Brackets', 'priority': 10, 'track_width': .34, 'clearance': .19},
++               {'name': 'Low', 'priority': 20, 'track_width': .4, 'clearance': .4},
++               {'name': 'High', 'priority': 1, 'track_width': .33, 'clearance': .18},
++               {'name': 'WidthOnly', 'priority': 0, 'track_width': .45},
++               {'name': 'ClearanceOnly', 'priority': 5, 'clearance': .21},
++               {'name': 'Zulu', 'priority': 3, 'track_width': .7, 'clearance': .7},
++               {'name': 'Alpha', 'priority': 3, 'track_width': .19, 'clearance': .16},
++               {'name': 'Zero', 'priority': 0, 'track_width': .23, 'clearance': 0}]
++    patterns = [(r'regex_out\d+', 'Regex'), ('glob.?', 'Glob'),
++                ('literal[2]', 'Brackets'), ('prio.*', 'Low'),
++                (r'prio\d+', 'High'), ('merge*', 'ClearanceOnly'),
++                ('explicit_pattern*', 'High'), ('[broken*', 'Glob'),
++                ('prefix|other', 'Regex'), ('DATA[0..2]', 'Regex')]
++    return {'meta': {'filename': 'board.kicad_pro', 'version': 1},
++            'board': {'design_settings': {'rules': {'min_clearance': 0,
++                                                    'min_track_width': .1}}},
++            'net_settings': {'meta': {'version': 4}, 'classes': classes,
++                             'netclass_assignments': {'merge7': ['WidthOnly'],
++                                                      'tie7': ['Zulu', 'Alpha'],
++                                                      'explicit_pattern7': ['Low'],
++                                                      'unknown': ['Ghost'],
++                                                      'zero': ['Zero']},
++                             'netclass_patterns': [{'pattern': p, 'netclass': c}
++                                                   for p, c in patterns]}}
++
++
++def write_fixture(directory, project=None):
++    directory = Path(directory)
++    directory.mkdir(parents=True, exist_ok=True)
++    path = directory / 'board.kicad_pcb'
++    nets = '\n'.join(f'(net {i} {json.dumps(n)})' for i, n in enumerate(EXPECTED, 1))
++    path.write_text('''(kicad_pcb (version 20240108) (generator "netclass_probe")
++      (general (thickness 1.6)) (paper "A4")
++      (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))
++      (setup (pad_to_mask_clearance 0)) (net 0 "")
++      ''' + nets + '''
++      (gr_rect (start 0 0) (end 20 20) (stroke (width 0.1) (type default))
++               (fill none) (layer "Edge.Cuts")))\n''')
++    path.with_suffix('.kicad_pro').write_text(json.dumps(project or fixture_project(), indent=2) + '\n')
++    return path
++
++
++class NetclassResolution(unittest.TestCase):
++    def test_schema3_migration_replaces_stored_priorities(self):
++        from design_rules import DesignRules
++        from list_nets import read_design_rules, net_track_width_map_by_id, net_clearance_map_by_id
++        project = fixture_project()
++        project['net_settings']['meta']['version'] = 3
++        project['net_settings']['netclass_assignments'] = {
++            name: values[-1] for name, values in project['net_settings']['netclass_assignments'].items()}
++        with tempfile.TemporaryDirectory() as tmp:
++            board = write_fixture(tmp, project)
++            names = {1: 'prio7', 2: 'explicit_pattern7'}
++            pcb = SimpleNamespace(nets={i: SimpleNamespace(name=n) for i, n in names.items()},
++                                  groups={}, board_info=SimpleNamespace(copper_layers=[]))
++            rules = DesignRules.from_project(pcb, str(board))
++            read = read_design_rules(str(board))
++            widths = net_track_width_map_by_id(str(board), names, read)
++            clearances = net_clearance_map_by_id(str(board), names, read)
++            for nid in names:
++                with self.subTest(net=names[nid]):
++                    # Native 10.0.4 rebuilds priorities in file order during
++                    # schema 3 -> 4 migration: Low precedes High here.
++                    self.assertEqual(rules.class_value(nid, 'track_width'), .4)
++                    self.assertEqual(rules.class_value(nid, 'clearance'), .4)
++                    self.assertEqual(widths[nid], .4)
++                    self.assertEqual(clearances[nid], .4)
++
++    def test_consumers_agree_on_native_checked_properties(self):
++        from design_rules import DesignRules
++        from list_nets import (read_design_rules, net_class_memberships,
++                               net_track_width_map_by_id, net_clearance_map_by_id,
++                               net_clearance_map)
++        with tempfile.TemporaryDirectory() as tmp:
++            board = write_fixture(tmp)
++            names = dict(enumerate(EXPECTED, 1))
++            pcb = SimpleNamespace(nets={i: SimpleNamespace(name=n) for i, n in names.items()},
++                                  groups={}, board_info=SimpleNamespace(copper_layers=['F.Cu', 'B.Cu']))
++            rules = DesignRules.from_project(pcb, str(board))
++            read = read_design_rules(str(board))
++            widths = net_track_width_map_by_id(str(board), names, read)
++            clrs = net_clearance_map_by_id(str(board), names, read)
++            by_name = net_clearance_map(str(board), names.values(), read)
++            members = net_class_memberships(str(board), names, read)
++            for nid, name in names.items():
++                with self.subTest(net=name):
++                    width, clearance = EXPECTED[name]
++                    self.assertEqual(rules.class_value(nid, 'track_width'), width)
++                    self.assertEqual(rules.class_value(nid, 'clearance'), clearance)
++                    self.assertEqual(widths.get(nid, .2), width)
++                    self.assertEqual(clrs.get(nid, .2), clearance)
++                    self.assertEqual(by_name[name], clearance)
++                    self.assertEqual(set(rules.memberships.get(nid, ())), members.get(nid, set()))
++            unknown = next(nid for nid, name in names.items() if name == 'unknown')
++            self.assertIn('Ghost', rules.memberships[unknown])
++
++    def test_unsupported_patterns_are_explicit_errors(self):
++        from netclass_resolver import resolve_memberships, UnsupportedNetclassPattern
++        for pattern in ('[[:digit:]]+', r'\mNET\M', '(?i)NET', 'BUS{A B}', '~{D[0..2]}'):
++            with self.subTest(pattern=pattern):
++                with self.assertRaises(UnsupportedNetclassPattern):
++                    resolve_memberships({1: 'not-a-match'}, {}, [(pattern, 'Signal')])
++
++    def test_vector_expansion_is_bounded(self):
++        from netclass_resolver import expanded_patterns, UnsupportedNetclassPattern
++        self.assertEqual(expanded_patterns('DATA[2..0]'), ('DATA0', 'DATA1', 'DATA2'))
++        with self.assertRaises(UnsupportedNetclassPattern):
++            expanded_patterns('DATA[0..5000]')
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/test_pour_launch_teardrops.py b/tests/test_pour_launch_teardrops.py
+new file mode 100644
+index 0000000..d84c43d
+--- /dev/null
++++ b/tests/test_pour_launch_teardrops.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""Generated teardrops must not become POUR-LAUNCH attachment targets.
++
++Removing a track can leave its old teardrop outlines in the input file.
++KiCad regenerates those areas on refill; a route ending on the old outline
++can therefore become an isolated segment. Both the two-terminal and
++multipoint launch paths must ignore generated teardrops while retaining
++anchors from an ordinary pour with exactly the same geometry.
++
++Reuse the small, generated four-layer board from the forbidden-weld test:
++one plated pad reaches an inner-layer zone and three surface pads need to
++reach it. Only the zone's generated-teardrop attribute changes between the
++two controls. No routing, pcbnew, external fixture, or cloud runner needed.
++
++    python3 tests/test_pour_launch_teardrops.py
++"""
++import contextlib
++import io
++import os
++import sys
++import tempfile
++
++TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(TESTS_DIR)
++sys.path.insert(0, os.path.join(ROOT, 'py_router'))
++sys.path.insert(0, TESTS_DIR)
++
++from test_1292_pour_launch_forbidden_welds import (  # noqa: E402
++    ALL_LAYERS, ALLOW, IN1, _cfg, _gnd, board_text,
++)
++
++
++def quiet(fn, *args, **kwargs):
++    with contextlib.redirect_stdout(io.StringIO()):
++        return fn(*args, **kwargs)
++
++
++def pair_anchors(pcb):
++    from routing_config import GridCoord
++    from single_ended_routing import _pour_launch_pair_anchors
++
++    cfg = _cfg(ALLOW)
++    coord = GridCoord(cfg.grid_step)
++
++    def row(x, y):
++        gx, gy = coord.to_grid(x, y)
++        return (gx, gy, 0, x, y)
++
++    return quiet(_pour_launch_pair_anchors, pcb, _gnd(pcb),
++                 [row(11.5, 6.0)], [row(3.0, 3.0)],
++                 list(ALL_LAYERS), coord, cfg)
++
++
++def region_cells(pcb):
++    from connectivity import get_multipoint_net_pads, get_terminal_component_info
++    from routing_config import GridCoord
++    from single_ended_routing import _pour_launch_region_cells
++
++    cfg = _cfg(ALLOW)
++    net_id = _gnd(pcb)
++    pad_info = quiet(get_multipoint_net_pads, pcb, net_id, cfg)
++    comps = get_terminal_component_info(pcb, net_id, pad_info)[0]
++    return quiet(_pour_launch_region_cells, pcb, net_id, pad_info, comps,
++                 list(ALL_LAYERS), GridCoord(cfg.grid_step), {}, cfg)
++
++
++def main():
++    from kicad_parser import parse_kicad_pcb
++
++    failures = []
++
++    def check(name, passed, detail=''):
++        print(('PASS ' if passed else 'FAIL ') + name
++              + (f': {detail}' if detail else ''))
++        if not passed:
++            failures.append(name)
++
++    ordinary = board_text()
++    marker = '(hatch edge 0.5)'
++    assert ordinary.count(marker) == 1, 'fixture must contain exactly one zone'
++    generated = ordinary.replace(
++        marker, '(attr (teardrop (type padvia))) ' + marker, 1)
++
++    with tempfile.TemporaryDirectory(prefix='pour_launch_teardrops_') as tmp:
++        paths = {}
++        for name, contents in (('pour', ordinary), ('teardrop', generated)):
++            path = os.path.join(tmp, name + '.kicad_pcb')
++            with open(path, 'w', encoding='utf-8', newline='\n') as stream:
++                stream.write(contents)
++            paths[name] = path
++
++        # Parse fresh boards for each producer so a fill/grouping memo from
++        # another assertion cannot supply stale anchors or mask a failure.
++        for name in ('pour', 'teardrop'):
++            pcb = quiet(parse_kicad_pcb, paths[name])
++            assert len(pcb.zones) == 1, 'fixture zone was not parsed'
++            assert pcb.zones[0].teardrop == (name == 'teardrop'), (
++                'fixture generated-teardrop attribute was not parsed')
++            extra_source, extra_target = pair_anchors(pcb)
++            count = len(extra_source) + len(extra_target)
++            if name == 'pour':
++                check('pair retains ordinary-pour target anchors',
++                      any(row[2] == IN1 for row in extra_target),
++                      f'{count} anchors')
++            else:
++                check('pair rejects generated-teardrop anchors',
++                      not extra_source and not extra_target,
++                      f'{count} anchors')
++
++            pcb = quiet(parse_kicad_pcb, paths[name])
++            cells = region_cells(pcb)
++            rows = [key for component in cells.values() for key in component]
++            if name == 'pour':
++                check('multipoint retains ordinary-pour region cells',
++                      any(key[2] == IN1 for key in rows),
++                      f'{len(rows)} cells')
++            else:
++                check('multipoint rejects generated-teardrop region cells',
++                      not rows, f'{len(rows)} cells')
++
++    if failures:
++        print(f'FAILED: {len(failures)} check(s)')
++        return 1
++    print('ALL PASS')
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())

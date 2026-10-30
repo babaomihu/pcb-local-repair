@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "prepared_at": "2026-10-30",
+  "purpose": "Runtime source pins for the minimal 0.9.5.dev13 source distribution; historical unrelated research inventory omitted.",
+  "sources": [
+    {
+      "path": "KiCadRoutingTools",
+      "commit": "bda59fa09496648d4677d8dc17b2ab60af6a49b1",
+      "source_version": "0.23.7",
+      "origin": "https://github.com/drandyhaas/KiCadRoutingTools.git"
+    },
+    {
+      "path": "PCBWorld/engine",
+      "commit": "30d6a68261b8631e58f0a39c915b1cd9467bf00a",
+      "source_version": "v1.1.0",
+      "origin": "https://github.com/LGAI-Research/PCBWorld-Engine.git"
+    },
+    {
+      "path": "PCBWorld/engine/kicad-python",
+      "commit": "66ff9ec17d247153aab9e4b7bee1fdbd3ef199ff",
+      "source_version": "0.6.0",
+      "origin": "https://gitlab.com/kicad/code/kicad-python.git"
+    },
+    {
+      "path": "PCBWorld/engine/kicad-python/kicad",
+      "commit": "b09c98053a892ff12d5c4f3c2070ca9bfca20106",
+      "source_version": "9.0.8",
+      "origin": "https://gitlab.com/kicad/code/kicad.git"
+    }
+  ],
+  "runtime_patch_state": {
+    "recorded_at": "2026-10-25",
+    "note": "Appended runtime state; original sources audit fields above retain their meaning at verified_at, including working_tree_clean and build_performed.",
+    "source": "KiCadRoutingTools",
+    "base_commit": "bda59fa09496648d4677d8dc17b2ab60af6a49b1",
+    "default_patch_set": "v0.8.9",
+    "manifest": "patches/krt-v0.8.9-manifest.json",
+    "manifest_sha256": "4aeb02fb5962959b54042a85358a4edda86347d3fc68c5bb3bb7ee7b6dce50e4",
+    "build_lock": "runtime-lock.json",
+    "requirements_lock": "requirements-krt.lock.txt",
+    "upstream_audit_fields_preserved": true,
+    "runtime_sparse_checkout_patterns": [
+      "/*",
+      "!/kicad_files/",
+      "!/tests/fixtures/",
+      "!/awx/"
+    ]
+  },
+  "complete_drc_v06": {
+    "source_url": "https://github.com/KiCad/kicad-source-mirror.git",
+    "source_tag": "10.0.4",
+    "source_commit": "f7414d419cae5df2d00e7eaacb16fc0e803799bc",
+    "patch": "patches/kicad10-drc-report-capacity.patch",
+    "patch_sha256": "17cd7317c8ad9c1d239a37e279caccd851e660929f4f93dd0853850dbba138f4",
+    "license": "GPL-3.0-or-later combined patch; original per-file notices retained",
+    "recipe": "scripts/setup_drc_complete.py"
+  }
+}

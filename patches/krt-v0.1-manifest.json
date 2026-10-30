@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "origin": "https://github.com/drandyhaas/KiCadRoutingTools.git",
+    "commit": "bda59fa09496648d4677d8dc17b2ab60af6a49b1",
+    "license": "MIT",
+    "license_path": "LICENSE",
+    "license_sha256": "6df0be9100e852f1749d2e88df423b0f71cab5bff7af35f749e10cf644911390",
+    "copyright": "Copyright (c) 2026 drandyhaas"
+  },
+  "contributions": {
+    "license": "MIT",
+    "copyright": "Copyright (c) 2026 PCB Local Repair contributors",
+    "notice": "Our changes and new regression tests in these KRT patch sets are licensed under MIT. Retain the upstream and contribution copyright notices and the upstream MIT license text. This does not relicense the project integration layer."
+  },
+  "default_patch_set": "v0.1",
+  "patch_sets": {
+    "v0.1": {
+      "patch": "patches/krt-v0.1-complete.patch",
+      "sha256": "9e73089623050b1cadb4f25dbc577c3327e50b73268a34c3a2bf41704f476d20",
+      "tracked_diff_sha256": "8fc3260eb51c5f5248b50225a043c428d49548110a54975b87821c1f9733da91",
+      "files": {
+        "py_router/design_rules.py": "abbe7fec6d6a5d4d426e4c3856ac5ebee6ea512a1d33ba6f99900bb8b5dead52",
+        "py_router/list_nets.py": "80310415905222a12e432a668cb37d971b759ad13d48b2eb51bc11310cd21b90",
+        "py_router/route.py": "57f54f36dad40028159b323cb4dfc459bcf2e448560f3bceaadea2ba6716f22e",
+        "py_router/single_ended_routing.py": "e0829d93eaa0fb55266e8f53f6fdf763de47829c3ccf8a4c6ce35fe2cbe5c7d4",
+        "py_router/netclass_resolver.py": "7bde9e811e5c3e9238126c64ec21f63e76029c421c2053ee68523e43eace2d14",
+        "tests/test_literal_nets_cli.py": "388f4bb14dbe264ff230b7c9c433c9020c846a8657e1143a77952304aa069680",
+        "tests/test_netclass_resolution.py": "e23051311ff29699ac122664f0fc5342d72179fbbff33ff0e8e476f0626fa482",
+        "tests/test_pour_launch_teardrops.py": "80436af299f019ff0728516426498b47589816a2a62f3f5ea49efdc9d0b46898"
+      },
+      "added_files": [
+        "py_router/netclass_resolver.py",
+        "tests/test_literal_nets_cli.py",
+        "tests/test_netclass_resolution.py",
+        "tests/test_pour_launch_teardrops.py"
+      ],
+      "changes": [
+        "Exclude generated teardrops from pour-launch anchors.",
+        "Resolve regex/wildcard and aggregate netclass properties with native parity preflight.",
+        "Support literal full net names without wildcard or leaf-name expansion."
+      ],
+      "verification": [
+        "runs/regression-teardrop/",
+        "runs/netclass-20261023/final-evidence-index.json",
+        "runs/netclass-20261023/literal-nets-evidence.json"
+      ]
+    },
+    "teardrop": {
+      "patch": "patches/krt-generated-teardrop-anchors.patch",
+      "sha256": "814a224d0e4944de2c49cfdca7283639e9f56092b857a6b4d095e246e16a8952",
+      "tracked_diff_sha256": "814a224d0e4944de2c49cfdca7283639e9f56092b857a6b4d095e246e16a8952",
+      "files": {
+        "py_router/single_ended_routing.py": "e0829d93eaa0fb55266e8f53f6fdf763de47829c3ccf8a4c6ce35fe2cbe5c7d4"
+      },
+      "added_files": [],
+      "historical": true
+    },
+    "teardrop-with-test": {
+      "patch": "patches/krt-generated-teardrop-with-test.patch",
+      "sha256": "8b8a850821182bb1112a1bb74bd25d24facb22d5ed482ae338cf7dfba8682fd4",
+      "tracked_diff_sha256": "814a224d0e4944de2c49cfdca7283639e9f56092b857a6b4d095e246e16a8952",
+      "files": {
+        "py_router/single_ended_routing.py": "e0829d93eaa0fb55266e8f53f6fdf763de47829c3ccf8a4c6ce35fe2cbe5c7d4",
+        "tests/test_pour_launch_teardrops.py": "80436af299f019ff0728516426498b47589816a2a62f3f5ea49efdc9d0b46898"
+      },
+      "added_files": [
+        "tests/test_pour_launch_teardrops.py"
+      ],
+      "historical": true
+    },
+    "pristine": {
+      "patch": null,
+      "sha256": null,
+      "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "files": {},
+      "added_files": [],
+      "historical": true
+    }
+  },
+  "runtime_sparse_checkout_patterns": [
+    "/*",
+    "!/kicad_files/",
+    "!/tests/fixtures/",
+    "!/awx/"
+  ]
+}

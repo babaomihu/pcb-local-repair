@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools==84.2.1", "wheel==0.48.0", "packaging==25.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pcb-local-repair"
+version = "0.9.5.dev13"
+description = "Conservative local PCB routing repair with independent KiCad acceptance"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+pcb-local = "pcb_local.cli:main"
+pcb-local-explain = "pcb_local.explain_result:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+

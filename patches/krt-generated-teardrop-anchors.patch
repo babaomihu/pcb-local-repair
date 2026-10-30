@@ -1,0 +1,27 @@
+diff --git a/py_router/single_ended_routing.py b/py_router/single_ended_routing.py
+index 5b9f471..a51f0e9 100644
+--- a/py_router/single_ended_routing.py
++++ b/py_router/single_ended_routing.py
+@@ -3844,7 +3844,10 @@ def _pour_launch_region_cells(pcb_data, net_id, pad_info, pad_components,
+     out = {}
+     _bare_kept = 0
+     try:
+-        _zones = [z for z in (pcb_data.zones or []) if z.net_id == net_id
++        from kicad_parser import pour_zones
++        # Generated teardrops can disappear when their parent track is removed
++        # and KiCad refills. They are not persistent pour launch terminals.
++        _zones = [z for z in pour_zones(pcb_data.zones) if z.net_id == net_id
+                   and z.layer in layer_names]
+         for _z in _zones:
+             _m = get_zone_model(pcb_data, _z)
+@@ -3966,7 +3969,9 @@ def _pour_launch_pair_anchors(pcb_data, net_id, sources, targets,
+         import numpy as _np
+     except Exception:
+         return [], []
+-    _zones = [z for z in (getattr(pcb_data, 'zones', None) or [])
++    from kicad_parser import pour_zones
++    # A stale teardrop must not replace the pad/track endpoint it used to join.
++    _zones = [z for z in pour_zones(getattr(pcb_data, 'zones', None))
+               if z.net_id == net_id and z.layer in layer_names]
+     if not _zones:
+         return [], []

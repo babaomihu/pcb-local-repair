@@ -1,0 +1,162 @@
+diff --git a/py_router/single_ended_routing.py b/py_router/single_ended_routing.py
+index 5b9f471..a51f0e9 100644
+--- a/py_router/single_ended_routing.py
++++ b/py_router/single_ended_routing.py
+@@ -3844,7 +3844,10 @@ def _pour_launch_region_cells(pcb_data, net_id, pad_info, pad_components,
+     out = {}
+     _bare_kept = 0
+     try:
+-        _zones = [z for z in (pcb_data.zones or []) if z.net_id == net_id
++        from kicad_parser import pour_zones
++        # Generated teardrops can disappear when their parent track is removed
++        # and KiCad refills. They are not persistent pour launch terminals.
++        _zones = [z for z in pour_zones(pcb_data.zones) if z.net_id == net_id
+                   and z.layer in layer_names]
+         for _z in _zones:
+             _m = get_zone_model(pcb_data, _z)
+@@ -3966,7 +3969,9 @@ def _pour_launch_pair_anchors(pcb_data, net_id, sources, targets,
+         import numpy as _np
+     except Exception:
+         return [], []
+-    _zones = [z for z in (getattr(pcb_data, 'zones', None) or [])
++    from kicad_parser import pour_zones
++    # A stale teardrop must not replace the pad/track endpoint it used to join.
++    _zones = [z for z in pour_zones(getattr(pcb_data, 'zones', None))
+               if z.net_id == net_id and z.layer in layer_names]
+     if not _zones:
+         return [], []
+diff --git a/tests/test_pour_launch_teardrops.py b/tests/test_pour_launch_teardrops.py
+new file mode 100644
+index 0000000..d84c43d
+--- /dev/null
++++ b/tests/test_pour_launch_teardrops.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""Generated teardrops must not become POUR-LAUNCH attachment targets.
++
++Removing a track can leave its old teardrop outlines in the input file.
++KiCad regenerates those areas on refill; a route ending on the old outline
++can therefore become an isolated segment. Both the two-terminal and
++multipoint launch paths must ignore generated teardrops while retaining
++anchors from an ordinary pour with exactly the same geometry.
++
++Reuse the small, generated four-layer board from the forbidden-weld test:
++one plated pad reaches an inner-layer zone and three surface pads need to
++reach it. Only the zone's generated-teardrop attribute changes between the
++two controls. No routing, pcbnew, external fixture, or cloud runner needed.
++
++    python3 tests/test_pour_launch_teardrops.py
++"""
++import contextlib
++import io
++import os
++import sys
++import tempfile
++
++TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(TESTS_DIR)
++sys.path.insert(0, os.path.join(ROOT, 'py_router'))
++sys.path.insert(0, TESTS_DIR)
++
++from test_1292_pour_launch_forbidden_welds import (  # noqa: E402
++    ALL_LAYERS, ALLOW, IN1, _cfg, _gnd, board_text,
++)
++
++
++def quiet(fn, *args, **kwargs):
++    with contextlib.redirect_stdout(io.StringIO()):
++        return fn(*args, **kwargs)
++
++
++def pair_anchors(pcb):
++    from routing_config import GridCoord
++    from single_ended_routing import _pour_launch_pair_anchors
++
++    cfg = _cfg(ALLOW)
++    coord = GridCoord(cfg.grid_step)
++
++    def row(x, y):
++        gx, gy = coord.to_grid(x, y)
++        return (gx, gy, 0, x, y)
++
++    return quiet(_pour_launch_pair_anchors, pcb, _gnd(pcb),
++                 [row(11.5, 6.0)], [row(3.0, 3.0)],
++                 list(ALL_LAYERS), coord, cfg)
++
++
++def region_cells(pcb):
++    from connectivity import get_multipoint_net_pads, get_terminal_component_info
++    from routing_config import GridCoord
++    from single_ended_routing import _pour_launch_region_cells
++
++    cfg = _cfg(ALLOW)
++    net_id = _gnd(pcb)
++    pad_info = quiet(get_multipoint_net_pads, pcb, net_id, cfg)
++    comps = get_terminal_component_info(pcb, net_id, pad_info)[0]
++    return quiet(_pour_launch_region_cells, pcb, net_id, pad_info, comps,
++                 list(ALL_LAYERS), GridCoord(cfg.grid_step), {}, cfg)
++
++
++def main():
++    from kicad_parser import parse_kicad_pcb
++
++    failures = []
++
++    def check(name, passed, detail=''):
++        print(('PASS ' if passed else 'FAIL ') + name
++              + (f': {detail}' if detail else ''))
++        if not passed:
++            failures.append(name)
++
++    ordinary = board_text()
++    marker = '(hatch edge 0.5)'
++    assert ordinary.count(marker) == 1, 'fixture must contain exactly one zone'
++    generated = ordinary.replace(
++        marker, '(attr (teardrop (type padvia))) ' + marker, 1)
++
++    with tempfile.TemporaryDirectory(prefix='pour_launch_teardrops_') as tmp:
++        paths = {}
++        for name, contents in (('pour', ordinary), ('teardrop', generated)):
++            path = os.path.join(tmp, name + '.kicad_pcb')
++            with open(path, 'w', encoding='utf-8', newline='\n') as stream:
++                stream.write(contents)
++            paths[name] = path
++
++        # Parse fresh boards for each producer so a fill/grouping memo from
++        # another assertion cannot supply stale anchors or mask a failure.
++        for name in ('pour', 'teardrop'):
++            pcb = quiet(parse_kicad_pcb, paths[name])
++            assert len(pcb.zones) == 1, 'fixture zone was not parsed'
++            assert pcb.zones[0].teardrop == (name == 'teardrop'), (
++                'fixture generated-teardrop attribute was not parsed')
++            extra_source, extra_target = pair_anchors(pcb)
++            count = len(extra_source) + len(extra_target)
++            if name == 'pour':
++                check('pair retains ordinary-pour target anchors',
++                      any(row[2] == IN1 for row in extra_target),
++                      f'{count} anchors')
++            else:
++                check('pair rejects generated-teardrop anchors',
++                      not extra_source and not extra_target,
++                      f'{count} anchors')
++
++            pcb = quiet(parse_kicad_pcb, paths[name])
++            cells = region_cells(pcb)
++            rows = [key for component in cells.values() for key in component]
++            if name == 'pour':
++                check('multipoint retains ordinary-pour region cells',
++                      any(key[2] == IN1 for key in rows),
++                      f'{len(rows)} cells')
++            else:
++                check('multipoint rejects generated-teardrop region cells',
++                      not rows, f'{len(rows)} cells')
++
++    if failures:
++        print(f'FAILED: {len(failures)} check(s)')
++        return 1
++    print('ALL PASS')
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
